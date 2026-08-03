@@ -22,6 +22,12 @@
       ],
       "@proj-airi/stage-layouts/*": [
         "../../packages/stage-layouts/src/*"
+      ],
+      "@proj-airi/electron-vueuse": [
+        "../../packages/electron-vueuse/src/index.ts"
+      ],
+      "@proj-airi/electron-vueuse/*": [
+        "../../packages/electron-vueuse/src/*"
       ]
     },
     "resolveJsonModule": true,
@@ -32,9 +38,9 @@
       "vite-plugin-vue-layouts/client",
       "vue-macros/macros-global",
       "electron-vite/node",
-      "unplugin-vue-router/client",
       "unplugin-info/client",
-      "@proj-airi/stage-shared/electron-renderer"
+      "@proj-airi/stage-shared/electron-renderer",
+      "@webgpu/types"
     ],
     "allowJs": true,
     "strict": true,

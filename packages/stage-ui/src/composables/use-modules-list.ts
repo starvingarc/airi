@@ -6,6 +6,7 @@ import { useI18n } from 'vue-i18n'
 
 import factorioIcon from '../assets/factorio-simple.png'
 
+import { useArtistryStore } from '../stores/modules/artistry'
 import { useConsciousnessStore } from '../stores/modules/consciousness'
 import { useDiscordStore } from '../stores/modules/discord'
 import { useFactorioStore } from '../stores/modules/gaming-factorio'
@@ -14,6 +15,7 @@ import { useHearingStore } from '../stores/modules/hearing'
 import { useSpeechStore } from '../stores/modules/speech'
 import { useTwitterStore } from '../stores/modules/twitter'
 import { useVisionStore } from '../stores/modules/vision'
+import { useWebSearchStore } from '../stores/modules/web-search'
 
 export interface Module {
   id: string
@@ -37,8 +39,10 @@ export function useModulesList() {
   const visionStore = useVisionStore()
   const discordStore = useDiscordStore()
   const twitterStore = useTwitterStore()
+  const webSearchStore = useWebSearchStore()
   const minecraftStore = useMinecraftStore()
   const factorioStore = useFactorioStore()
+  const artistryStore = useArtistryStore()
   const beatSyncState = ref<BeatSyncDetectorState>()
 
   minecraftStore.initialize()
@@ -78,6 +82,24 @@ export function useModulesList() {
       icon: 'i-solar:eye-closed-bold-duotone',
       to: '/settings/modules/vision',
       configured: visionStore.configured,
+      category: 'essential',
+    },
+    {
+      id: 'web-search',
+      name: t('settings.pages.modules.web-search.title'),
+      description: t('settings.pages.modules.web-search.description'),
+      icon: 'i-solar:magnifer-bold-duotone',
+      to: '/settings/modules/web-search',
+      configured: webSearchStore.configured,
+      category: 'essential',
+    },
+    {
+      id: 'artistry',
+      name: t('settings.pages.modules.artistry.title'),
+      description: t('settings.pages.modules.artistry.description'),
+      icon: 'i-solar:palette-bold-duotone',
+      to: '/settings/modules/artistry',
+      configured: artistryStore.configured,
       category: 'essential',
     },
     {

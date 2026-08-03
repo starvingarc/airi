@@ -31,9 +31,10 @@ import {
   TextStreamer,
   WhisperForConditionalGeneration,
 } from '@huggingface/transformers'
+import { errorMessageFromValue } from '@proj-airi/stage-shared'
 
 import { MODEL_IDS, MODEL_NAMES } from '../inference/constants'
-import { classifyError } from '../inference/protocol'
+import { classifyError, isRecoverable } from '../inference/protocol'
 
 // ---------------------------------------------------------------------------
 // Inference-specific input/output types
@@ -116,16 +117,35 @@ class AutomaticSpeechRecognitionPipeline {
       progress_callback,
     })
 
-    this.model ??= WhisperForConditionalGeneration.from_pretrained(this.model_id, {
-      dtype: {
-        // [v3.x] Cannot load whisper-v3-large-turbo · Issue #989 · huggingface/transformers.js
-        // https://github.com/huggingface/transformers.js/issues/989
-        encoder_model: 'fp16',
-        decoder_model_merged: 'q4', // 'fp16' is broken for decoder
-      },
-      device: actualDevice,
-      progress_callback,
-    })
+    // NOTICE: fp16 encoder may fail on some devices/browsers. Fall back to fp32
+    // if the initial load fails. Decoder fp16 is known broken (see Issue #989).
+    // https://github.com/huggingface/transformers.js/issues/989
+    this.model ??= (async () => {
+      try {
+        return await WhisperForConditionalGeneration.from_pretrained(this.model_id!, {
+          dtype: {
+            encoder_model: 'fp16',
+            decoder_model_merged: 'q4',
+          },
+          device: actualDevice,
+          progress_callback,
+        })
+      }
+      catch (error) {
+        console.warn(
+          '[Whisper Worker] fp16 encoder failed, falling back to fp32:',
+          errorMessageFromValue(error),
+        )
+        return await WhisperForConditionalGeneration.from_pretrained(this.model_id!, {
+          dtype: {
+            encoder_model: 'fp32',
+            decoder_model_merged: 'q4',
+          },
+          device: actualDevice,
+          progress_callback,
+        })
+      }
+    })()
 
     return Promise.all([this.tokenizer, this.processor, this.model])
   }
@@ -155,6 +175,42 @@ async function base64ToFeatures(base64Audio: string): Promise<Float32Array> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * RequestIds the main thread has asked us to cancel. When an in-flight
+ * operation resolves, we check this set before posting the result; if
+ * the id is present, we send a `CANCELLED` error instead so the adapter
+ * rejects the caller's promise deterministically.
+ *
+ * We cannot synchronously interrupt a transformers.js call already running
+ * on this thread (no abort primitive is exposed) — cancellation here is
+ * about not leaking the stale result, not about stopping GPU work.
+ */
+const cancelledRequestIds = new Set<string>()
+
+function markCancelled(targetRequestId: string): void {
+  cancelledRequestIds.add(targetRequestId)
+  // Emit the error now so the adapter can resolve immediately even if
+  // the inference keeps running in the background.
+  const msg: ErrorResponse = {
+    type: 'error',
+    requestId: targetRequestId,
+    payload: {
+      code: 'CANCELLED',
+      message: 'Operation cancelled by caller',
+      recoverable: false,
+    },
+  }
+  globalThis.postMessage(msg)
+}
+
+function isCancelled(requestId: string): boolean {
+  return cancelledRequestIds.has(requestId)
+}
+
+function clearCancelled(requestId: string): void {
+  cancelledRequestIds.delete(requestId)
+}
+
 function sendProgress(requestId: string, phase: 'download' | 'compile' | 'warmup' | 'inference', percent: number, message?: string, extra?: Record<string, unknown>): void {
   const msg: ProgressResponse = {
     type: 'progress',
@@ -169,15 +225,16 @@ function sendProgress(requestId: string, phase: 'download' | 'compile' | 'warmup
   globalThis.postMessage(msg)
 }
 
-function sendError(requestId: string, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error)
+function sendError(requestId: string, error: unknown, phase?: 'load' | 'inference'): void {
+  const message = errorMessageFromValue(error)
+  const code = classifyError(error, phase)
   const msg: ErrorResponse = {
     type: 'error',
     requestId,
     payload: {
-      code: classifyError(error),
+      code,
       message,
-      recoverable: false,
+      recoverable: isRecoverable(code),
     },
   }
   globalThis.postMessage(msg)
@@ -223,16 +280,25 @@ async function loadModel(request: LoadModelRequest): Promise<void> {
       max_new_tokens: 1,
     } as Record<string, unknown>)
 
-    const ready: ModelReadyResponse = {
-      type: 'model-ready',
-      requestId,
-      modelId: MODEL_NAMES.WHISPER,
-      device: resolvedDevice,
+    if (isCancelled(requestId)) {
+      // Adapter already received a CANCELLED error; drop the stale result.
+      clearCancelled(requestId)
     }
-    globalThis.postMessage(ready)
+    else {
+      const ready: ModelReadyResponse = {
+        type: 'model-ready',
+        requestId,
+        modelId: MODEL_NAMES.WHISPER,
+        device: resolvedDevice,
+      }
+      globalThis.postMessage(ready)
+    }
   }
   catch (error) {
-    sendError(requestId, error)
+    if (isCancelled(requestId))
+      clearCancelled(requestId)
+    else
+      sendError(requestId, error, 'load')
   }
   finally {
     currentLoadRequestId = null
@@ -248,8 +314,10 @@ let processing = false
 async function runInference(request: RunInferenceRequest<WhisperInput>): Promise<void> {
   const { requestId, input } = request
 
-  if (processing)
+  if (processing) {
+    sendError(requestId, new Error('Worker is busy processing another request'), 'inference')
     return
+  }
   processing = true
 
   try {
@@ -289,15 +357,23 @@ async function runInference(request: RunInferenceRequest<WhisperInput>): Promise
 
     const outputText = tokenizer.batch_decode(outputs as Tensor, { skip_special_tokens: true })
 
-    const result: InferenceResultResponse<WhisperOutput> = {
-      type: 'inference-result',
-      requestId,
-      output: { text: outputText },
+    if (isCancelled(requestId)) {
+      clearCancelled(requestId)
     }
-    globalThis.postMessage(result)
+    else {
+      const result: InferenceResultResponse<WhisperOutput> = {
+        type: 'inference-result',
+        requestId,
+        output: { text: outputText },
+      }
+      globalThis.postMessage(result)
+    }
   }
   catch (error) {
-    sendError(requestId, error)
+    if (isCancelled(requestId))
+      clearCancelled(requestId)
+    else
+      sendError(requestId, error, 'inference')
   }
   finally {
     processing = false
@@ -321,6 +397,9 @@ globalThis.addEventListener('message', async (event: MessageEvent<WorkerInboundM
     case 'unload-model':
       // Whisper uses singleton pattern — can't fully unload, but acknowledge
       globalThis.postMessage({ type: 'model-unloaded', requestId: message.requestId })
+      break
+    case 'cancel':
+      markCancelled(message.targetRequestId)
       break
   }
 })

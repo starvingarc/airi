@@ -13,8 +13,11 @@ import type { WorkflowSuspension } from '../workflows'
 import type { ExecuteAction } from './action-executor'
 import type { ComputerUseServerRuntime } from './runtime'
 
+import { errorMessageFrom } from '@moeru/std'
 import { z } from 'zod'
 
+import { diagnoseBrowserActionError } from '../browser-dom/browser-repair-contract'
+import { getUnsupportedBrowserDomActions, isBrowserDomActionSupported } from '../browser-dom/capabilities'
 import { getRuntimePreflight } from '../preflight'
 import { summarizeRunState } from '../transparency'
 import {
@@ -34,7 +37,9 @@ import {
   summarizeCoordinateSpace,
 } from './formatters'
 import { refreshRuntimeRunState } from './refresh-run-state'
+import { executeChromeEnsure } from './register-chrome-session'
 import { createAcquirePtyCallback, executeApprovedPtyCreate } from './register-pty'
+import { createToolLaneHygieneServer } from './tool-lane-hygiene'
 import { formatWorkflowStructuredContent } from './workflow-formatter'
 import { createWorkflowPrepToolExecutor } from './workflow-prep-tools'
 
@@ -82,22 +87,57 @@ function summarizeBrowserDomFrameResults(label: string, results: Array<BrowserDo
   return `${label}: ${successfulFrames.length}/${results.length} frame(s) succeeded.`
 }
 
-function buildBrowserDomUnavailableResponse(runtime: ComputerUseServerRuntime) {
+function buildBrowserDomUnavailableResponse(runtime: ComputerUseServerRuntime, unsupportedActions?: string[]) {
   const status = runtime.browserDomBridge.getStatus()
+  const detail = unsupportedActions?.length
+    ? `connected extension transport does not support ${unsupportedActions.join(', ')}`
+    : status.lastError || 'the browser extension is not connected yet'
   return {
     isError: true,
     content: [
-      textContent(`Browser DOM bridge is unavailable: ${status.lastError || 'the browser extension is not connected yet'}.`),
+      textContent(`Browser DOM bridge is unavailable: ${detail}.`),
     ],
     structuredContent: {
       status: 'unavailable',
       bridge: status,
+      unsupportedActions,
+    },
+  }
+}
+
+function buildBrowserDomActionErrorResponse(params: {
+  runtime: ComputerUseServerRuntime
+  error: unknown
+  selector: string
+  actionKind: string
+}) {
+  const { runtime, error, selector, actionKind } = params
+  const message = errorMessageFrom(error) ?? 'unknown error'
+  const repairSuggestion = diagnoseBrowserActionError(error, selector, actionKind)
+
+  return {
+    isError: true,
+    content: [
+      textContent(
+        repairSuggestion
+          ? `${actionKind} failed for "${selector}": ${message}\n\n${repairSuggestion.reactionText}`
+          : `${actionKind} failed for "${selector}": ${message}`,
+      ),
+    ],
+    structuredContent: {
+      status: 'error',
+      selector,
+      actionKind,
+      error: message,
+      repairSuggestion: repairSuggestion ?? undefined,
+      bridge: runtime.browserDomBridge.getStatus(),
     },
   }
 }
 
 export function registerComputerUseTools(params: RegisterComputerUseToolsOptions) {
-  const { server, runtime, executeAction, enableTestTools } = params
+  const { runtime, executeAction, enableTestTools } = params
+  const server = createToolLaneHygieneServer(params.server, runtime.stateManager)
   const executePrepTool = createWorkflowPrepToolExecutor(runtime)
   const acquirePty = createAcquirePtyCallback(runtime)
 
@@ -236,8 +276,8 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
   server.tool(
     'desktop_click',
     {
-      x: z.number().describe('Absolute screen X coordinate in pixels'),
-      y: z.number().describe('Absolute screen Y coordinate in pixels'),
+      x: z.number().describe('Global logical screen X coordinate, not Retina backing pixels'),
+      y: z.number().describe('Global logical screen Y coordinate, not Retina backing pixels'),
       button: z.enum(['left', 'right', 'middle']).optional().describe('Mouse button, default left'),
       clickCount: z.number().int().min(1).max(2).optional().describe('Number of clicks, default 1'),
       captureAfter: z.boolean().optional().describe('Whether to return a fresh screenshot after the action'),
@@ -249,8 +289,8 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
     'desktop_type_text',
     {
       text: z.string().min(1).describe('Text to type into the focused UI element'),
-      x: z.number().optional().describe('Optional X coordinate to click before typing'),
-      y: z.number().optional().describe('Optional Y coordinate to click before typing'),
+      x: z.number().optional().describe('Optional global logical screen X coordinate to click before typing'),
+      y: z.number().optional().describe('Optional global logical screen Y coordinate to click before typing'),
       pressEnter: z.boolean().optional().describe('Whether to press Enter after typing'),
       captureAfter: z.boolean().optional().describe('Whether to return a fresh screenshot after the action'),
     },
@@ -269,8 +309,8 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
   server.tool(
     'desktop_scroll',
     {
-      x: z.number().optional().describe('Optional X coordinate to move to before scrolling'),
-      y: z.number().optional().describe('Optional Y coordinate to move to before scrolling'),
+      x: z.number().optional().describe('Optional global logical screen X coordinate to move to before scrolling'),
+      y: z.number().optional().describe('Optional global logical screen Y coordinate to move to before scrolling'),
       deltaX: z.number().optional().describe('Horizontal scroll delta in pixels'),
       deltaY: z.number().describe('Vertical scroll delta in pixels'),
       captureAfter: z.boolean().optional().describe('Whether to return a fresh screenshot after the action'),
@@ -439,15 +479,16 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
         }
       }
       catch (error) {
+        const message = errorMessageFrom(error) ?? 'unknown error'
         return {
           isError: true,
           content: [
-            textContent(`Browser agent failed: ${error instanceof Error ? error.message : String(error)}`),
+            textContent(`Browser agent failed: ${message}`),
           ],
           structuredContent: {
             status: 'error',
             browserAgent: launchContext,
-            error: error instanceof Error ? error.message : String(error),
+            error: message,
           },
         }
       }
@@ -555,12 +596,49 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
     async ({ selector, tabId, frameIds }) => {
       if (!runtime.browserDomBridge.getStatus().connected)
         return buildBrowserDomUnavailableResponse(runtime)
+      const requiredActions = ['getClickTarget', 'clickAt']
+      if (!isBrowserDomActionSupported(runtime.browserDomBridge, ...requiredActions))
+        return buildBrowserDomUnavailableResponse(runtime, getUnsupportedBrowserDomActions(runtime.browserDomBridge, ...requiredActions))
 
-      const result = await runtime.browserDomBridge.clickSelector({
-        selector,
-        tabId,
-        frameIds,
-      })
+      let result: Awaited<ReturnType<typeof runtime.browserDomBridge.clickSelector>>
+      try {
+        result = await runtime.browserDomBridge.clickSelector({
+          selector,
+          tabId,
+          frameIds,
+        })
+      }
+      catch (error) {
+        return buildBrowserDomActionErrorResponse({
+          runtime,
+          error,
+          selector,
+          actionKind: 'browser_dom_click',
+        })
+      }
+
+      // NOTICE: clickSelector resolves even when the clickAt step misses
+      // (e.g. reflow between target lookup and click dispatch). Inspect
+      // per-frame results before reporting success.
+      const clickFrames = result?.clickResults
+      const anyClickSucceeded = Array.isArray(clickFrames) && clickFrames.some(
+        fr => (fr.result as Record<string, unknown>)?.success === true,
+      )
+      if (!anyClickSucceeded) {
+        return {
+          isError: true,
+          content: [
+            textContent(`browser_dom_click: clicked at (${result.targetPoint.x}, ${result.targetPoint.y}) in frame ${result.targetFrameId} but no frame reported a successful DOM click for "${selector}".`),
+          ],
+          structuredContent: {
+            status: 'click_miss',
+            selector,
+            ...result,
+            bridge: runtime.browserDomBridge.getStatus(),
+          },
+        }
+      }
+
       return {
         content: [
           textContent(`Clicked selector "${selector}" in frame ${result.targetFrameId} at (${result.targetPoint.x}, ${result.targetPoint.y}).`),
@@ -585,6 +663,9 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
     async ({ selector, tabId, frameIds }) => {
       if (!runtime.browserDomBridge.getStatus().connected)
         return buildBrowserDomUnavailableResponse(runtime)
+      const requiredActions = ['readInputValue']
+      if (!isBrowserDomActionSupported(runtime.browserDomBridge, ...requiredActions))
+        return buildBrowserDomUnavailableResponse(runtime, getUnsupportedBrowserDomActions(runtime.browserDomBridge, ...requiredActions))
 
       const results = await runtime.browserDomBridge.readInputValue({
         selector,
@@ -618,6 +699,9 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
     async ({ selector, value, simulateKeystrokes, blur, tabId, frameIds }) => {
       if (!runtime.browserDomBridge.getStatus().connected)
         return buildBrowserDomUnavailableResponse(runtime)
+      const requiredActions = ['setInputValue']
+      if (!isBrowserDomActionSupported(runtime.browserDomBridge, ...requiredActions))
+        return buildBrowserDomUnavailableResponse(runtime, getUnsupportedBrowserDomActions(runtime.browserDomBridge, ...requiredActions))
 
       const results = await runtime.browserDomBridge.setInputValue({
         selector,
@@ -653,6 +737,9 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
     async ({ selector, checked, tabId, frameIds }) => {
       if (!runtime.browserDomBridge.getStatus().connected)
         return buildBrowserDomUnavailableResponse(runtime)
+      const requiredActions = ['checkCheckbox']
+      if (!isBrowserDomActionSupported(runtime.browserDomBridge, ...requiredActions))
+        return buildBrowserDomUnavailableResponse(runtime, getUnsupportedBrowserDomActions(runtime.browserDomBridge, ...requiredActions))
 
       const results = await runtime.browserDomBridge.checkCheckbox({
         selector,
@@ -686,6 +773,9 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
     async ({ selector, value, tabId, frameIds }) => {
       if (!runtime.browserDomBridge.getStatus().connected)
         return buildBrowserDomUnavailableResponse(runtime)
+      const requiredActions = ['selectOption']
+      if (!isBrowserDomActionSupported(runtime.browserDomBridge, ...requiredActions))
+        return buildBrowserDomUnavailableResponse(runtime, getUnsupportedBrowserDomActions(runtime.browserDomBridge, ...requiredActions))
 
       const results = await runtime.browserDomBridge.selectOption({
         selector,
@@ -719,13 +809,27 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
     async ({ selector, timeoutMs, tabId, frameIds }) => {
       if (!runtime.browserDomBridge.getStatus().connected)
         return buildBrowserDomUnavailableResponse(runtime)
+      const requiredActions = ['waitForElement']
+      if (!isBrowserDomActionSupported(runtime.browserDomBridge, ...requiredActions))
+        return buildBrowserDomUnavailableResponse(runtime, getUnsupportedBrowserDomActions(runtime.browserDomBridge, ...requiredActions))
 
-      const results = await runtime.browserDomBridge.waitForElement({
-        selector,
-        timeoutMs,
-        tabId,
-        frameIds,
-      })
+      let results: Awaited<ReturnType<typeof runtime.browserDomBridge.waitForElement>>
+      try {
+        results = await runtime.browserDomBridge.waitForElement({
+          selector,
+          timeoutMs,
+          tabId,
+          frameIds,
+        })
+      }
+      catch (error) {
+        return buildBrowserDomActionErrorResponse({
+          runtime,
+          error,
+          selector,
+          actionKind: 'browser_dom_wait_for_element',
+        })
+      }
       return {
         content: [
           textContent(summarizeBrowserDomFrameResults(`wait_for_element for "${selector}"`, results)),
@@ -782,6 +886,9 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
     async ({ selector, properties, tabId, frameIds }) => {
       if (!runtime.browserDomBridge.getStatus().connected)
         return buildBrowserDomUnavailableResponse(runtime)
+      const requiredActions = ['getComputedStyles']
+      if (!isBrowserDomActionSupported(runtime.browserDomBridge, ...requiredActions))
+        return buildBrowserDomUnavailableResponse(runtime, getUnsupportedBrowserDomActions(runtime.browserDomBridge, ...requiredActions))
 
       const results = await runtime.browserDomBridge.getComputedStyles({
         selector,
@@ -816,6 +923,9 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
     async ({ selector, eventName, eventType, optsJson, tabId, frameIds }) => {
       if (!runtime.browserDomBridge.getStatus().connected)
         return buildBrowserDomUnavailableResponse(runtime)
+      const requiredActions = ['triggerEvent']
+      if (!isBrowserDomActionSupported(runtime.browserDomBridge, ...requiredActions))
+        return buildBrowserDomUnavailableResponse(runtime, getUnsupportedBrowserDomActions(runtime.browserDomBridge, ...requiredActions))
 
       let opts: Record<string, unknown> | undefined
       if (optsJson?.trim()) {
@@ -824,10 +934,11 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
           parsed = JSON.parse(optsJson) as unknown
         }
         catch (error) {
+          const message = errorMessageFrom(error) ?? 'unknown error'
           return {
             isError: true,
             content: [
-              textContent(`browser_dom_trigger_event expected optsJson to be valid JSON: ${error instanceof Error ? error.message : String(error)}`),
+              textContent(`browser_dom_trigger_event expected optsJson to be valid JSON: ${message}`),
             ],
             structuredContent: {
               status: 'invalid_params',
@@ -922,6 +1033,30 @@ export function registerComputerUseTools(params: RegisterComputerUseToolsOptions
 
       if (pending.action.kind === 'pty_create') {
         const result = await executeApprovedPtyCreate(runtime, pending.action.input)
+
+        await runtime.session.record({
+          event: result.isError === true ? 'failed' : 'executed',
+          toolName: pending.toolName,
+          action: pending.action,
+          context: pending.context,
+          policy: pending.policy,
+          result: {
+            pendingActionId: id,
+            ...(typeof result.structuredContent === 'object' && result.structuredContent !== null
+              ? result.structuredContent as Record<string, unknown>
+              : {}),
+          },
+        })
+
+        return result
+      }
+
+      if (pending.action.kind === 'desktop_ensure_chrome') {
+        const result = await executeChromeEnsure(
+          runtime,
+          pending.action.input,
+          pending.policy.estimatedOperationUnits,
+        )
 
         await runtime.session.record({
           event: result.isError === true ? 'failed' : 'executed',

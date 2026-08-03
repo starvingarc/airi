@@ -28,9 +28,12 @@ words:
   - autoplay
   - awilix
   - Ayaka
+  - Backquote
   - baichuan
   - baiducloud
   - bailian
+  - Basemove
+  - bestmove
   - bigserial
   - bilibili
   - Bitstream
@@ -48,11 +51,14 @@ words:
   - cjkfonts
   - clippy
   - clustr
+  - cmdorctrl
+  - codenames
   - codesign
   - collectblock
   - colorjs
   - cometapi
   - Comfortaa
+  - commandorcontrol
   - composables
   - cooldown
   - coreml
@@ -106,10 +112,13 @@ words:
   - eventa
   - Factorio
   - feaxios
+  - fflate
   - Flathub
   - flexsearch
   - formkit
   - frontmatter
+  - gamelet
+  - gamelets
   - Genshin
   - giteeai
   - gltf
@@ -154,6 +163,7 @@ words:
   - lerp
   - libsamplerate
   - libsodium
+  - libuiohook
   - lightningcss
   - lipsync
   - listhen
@@ -168,6 +178,7 @@ words:
   - lowpass
   - lucide
   - luoling
+  - lydell
   - Maekawa
   - magnifer
   - Makito
@@ -179,6 +190,7 @@ words:
   - MeshToonMaterial
   - meteocons
   - micvad
+  - MikuMikuDance
   - mineflayer
   - mingcute
   - minimizable
@@ -195,6 +207,7 @@ words:
   - msvc
   - multisampling
   - Myriam
+  - napi
   - ndarray
   - Neko
   - nekomeowww
@@ -267,6 +280,7 @@ words:
   - safetensors
   - SAVEPOINT
   - Screenable
+  - SDEF
   - sdkmanager
   - sensenova
   - serde
@@ -282,6 +296,7 @@ words:
   - softprops
   - sonarjs
   - sonner
+  - Spacebar
   - specta
   - splitpanes
   - splt
@@ -289,10 +304,12 @@ words:
   - ssml
   - staticlib
   - stepfun
+  - stockfish
   - sumimakito
   - supergroup
   - superjson
   - systempreferences
+  - tachie
   - tamagotchi
   - tauri
   - taze
@@ -302,10 +319,14 @@ words:
   - tinyexec
   - togetherapi
   - tolist
+  - toon
   - tresjs
   - Triggerable
+  - truncatable
   - tsdown
+  - ttft
   - turborepo
+  - uiohook
   - unbird
   - unbundle
   - unconfig
@@ -314,12 +335,14 @@ words:
   - Unlisten
   - unocss
   - unplugin
+  - unref
   - unspeech
   - upterm
   - userversion
   - valibot
   - vaul
   - velin
+  - vieval
   - vishot
   - VITE
   - vitepress
@@ -331,7 +354,6 @@ words:
   - vueuse
   - waapi
   - Waifu
-  - warpdrive
   - Warudo
   - wavefile
   - webgpu

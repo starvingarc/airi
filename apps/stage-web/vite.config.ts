@@ -7,18 +7,18 @@ import VueI18n from '@intlify/unplugin-vue-i18n/vite'
 import templateCompilerOptions from '@tresjs/core/template-compiler-options'
 import Vue from '@vitejs/plugin-vue'
 import Unocss from 'unocss/vite'
+import Basemove, { createS3Provider } from 'unplugin-basemove/vite'
 import Info from 'unplugin-info/vite'
-import VueRouter from 'unplugin-vue-router/vite'
 import Yaml from 'unplugin-yaml/vite'
 import Mkcert from 'vite-plugin-mkcert'
 import VueDevTools from 'vite-plugin-vue-devtools'
 import Layouts from 'vite-plugin-vue-layouts'
 import VueMacros from 'vue-macros/vite'
+import VueRouter from 'vue-router/vite'
 
 import { tryCatch } from '@moeru/std'
 import { Download } from '@proj-airi/unplugin-fetch/vite'
 import { DownloadLive2DSDK } from '@proj-airi/unplugin-live2d-sdk/vite'
-import { createS3Provider, WarpDrivePlugin } from '@proj-airi/vite-plugin-warpdrive'
 import { LFS, SpaceCard } from 'hfup/vite'
 import { defineConfig } from 'vite'
 import { VitePWA } from 'vite-plugin-pwa'
@@ -91,6 +91,23 @@ export default defineConfig({
     },
   },
   build: {
+    manifest: true,
+    rolldownOptions: {
+      output: {
+        chunkFileNames: (chunkInfo) => {
+          const containsAnalyticsModule = chunkInfo.moduleIds.some((moduleId) => {
+            const normalizedModuleId = moduleId.replaceAll('\\', '/').toLowerCase()
+            return normalizedModuleId.includes('analytics') || normalizedModuleId.includes('posthog')
+          })
+
+          // Only analytics/provider chunks receive the manual neutral mapping;
+          // all unrelated chunks retain Vite's readable default naming.
+          return containsAnalyticsModule
+            ? 'assets/auxiliary-[hash].js'
+            : 'assets/[name]-[hash].js'
+        },
+      },
+    },
     sourcemap: true,
   },
   worker: {
@@ -130,7 +147,6 @@ export default defineConfig({
       betterDefine: false,
     }),
 
-    // https://github.com/posva/unplugin-vue-router
     VueRouter({
       extensions: ['.vue', '.md'],
       dts: resolve(import.meta.dirname, 'src/typed-router.d.ts'),
@@ -155,6 +171,18 @@ export default defineConfig({
     Unocss(),
 
     // https://github.com/antfu/vite-plugin-pwa
+    // NOTICE:
+    // The plugin must stay registered in dev — `src/modules/pwa.ts` imports
+    // the `virtual:pwa-register` module the plugin synthesises, and dropping
+    // the plugin breaks Vite's import-analysis with a "Failed to resolve
+    // import" error.
+    // SW generation in dev is already disabled by `devOptions.enabled:
+    // false` (the plugin's own default). So new SWs do NOT register from
+    // `pnpm dev` alone — but a previously-registered SW (e.g. from an
+    // earlier `vite preview` / `vite build`) lives on per-origin in the
+    // browser and keeps intercepting fetches even in dev. To recover from
+    // that state, unregister via DevTools → Application → Storage → Clear
+    // site data.
     ...(env.TARGET_HUGGINGFACE_SPACE
       ? []
       : [VitePWA({
@@ -264,7 +292,7 @@ export default defineConfig({
     ...((!env.S3_ENDPOINT || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY)
       ? []
       : [
-          WarpDrivePlugin({
+          Basemove({
             prefix: env.STAGE_WEB_WARP_DRIVE_PREFIX || 'proj-airi/stage-web/main/',
             include: [/\.wasm$/i, /\.ttf$/i, /\.vrm$/i, /\.zip$/i], // in existing assets, wasm, ttf, vrm files are the largest ones
             manifest: true,

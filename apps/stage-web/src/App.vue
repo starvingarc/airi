@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { OnboardingDialog, OnboardingStepAnalyticsNotice, ToasterRoot } from '@proj-airi/stage-ui/components'
 import { useInferencePreload } from '@proj-airi/stage-ui/composables'
-import { isPosthogAvailableInBuild, useSharedAnalyticsStore } from '@proj-airi/stage-ui/stores/analytics'
+import { useAuthProviderSync } from '@proj-airi/stage-ui/composables/use-auth-provider-sync'
+import { isAnalyticsAvailableInBuild, useSharedAnalyticsStore } from '@proj-airi/stage-ui/stores/analytics'
 import { useCharacterOrchestratorStore } from '@proj-airi/stage-ui/stores/character'
 import { useChatSessionStore } from '@proj-airi/stage-ui/stores/chat/session-store'
 import { useDisplayModelsStore } from '@proj-airi/stage-ui/stores/display-models'
@@ -10,7 +11,7 @@ import { useContextBridgeStore } from '@proj-airi/stage-ui/stores/mods/api/conte
 import { useAiriCardStore } from '@proj-airi/stage-ui/stores/modules/airi-card'
 import { useOnboardingStore } from '@proj-airi/stage-ui/stores/onboarding'
 import { useSettings, useSettingsAudioDevice } from '@proj-airi/stage-ui/stores/settings'
-import { useTheme } from '@proj-airi/ui'
+import { ErrorBoundary, useTheme } from '@proj-airi/ui'
 import { StageTransitionGroup } from '@proj-airi/ui-transitions'
 import { storeToRefs } from 'pinia'
 import { computed, onMounted, onUnmounted, watch } from 'vue'
@@ -23,6 +24,7 @@ import PerformanceOverlay from './components/Devtools/PerformanceOverlay.vue'
 import { usePWAStore } from './stores/pwa'
 
 usePWAStore()
+useAuthProviderSync()
 
 const contextBridgeStore = useContextBridgeStore()
 const i18n = useI18n()
@@ -63,7 +65,7 @@ const colors = computed(() => {
 })
 
 const onboardingExtraSteps = computed(() => {
-  return isPosthogAvailableInBuild()
+  return isAnalyticsAvailableInBuild()
     ? [{ id: 'analytics-notice', component: OnboardingStepAnalyticsNotice }]
     : []
 })
@@ -128,7 +130,12 @@ function handleSetupSkipped() {
     :use-page-specific-transitions="settings.usePageSpecificTransitions.value"
   >
     <RouterView v-slot="{ Component }">
-      <component :is="Component" />
+      <ErrorBoundary
+        title="Something went wrong while rendering this page."
+        @error="(err, _, info) => console.error('[ErrorBoundary]', info, err)"
+      >
+        <component :is="Component" />
+      </ErrorBoundary>
     </RouterView>
   </StageTransitionGroup>
 

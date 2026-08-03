@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { ProviderMode } from '../../../../composables/use-analytics'
 import type { ProviderMetadata } from '../../../../stores/providers'
 import type {
   OnboardingStep,
@@ -9,13 +10,14 @@ import type {
 } from './types'
 
 import { storeToRefs } from 'pinia'
-import { computed, nextTick, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 
 import StepModelSelection from './step-model-selection.vue'
 import StepProviderConfiguration from './step-provider-configuration.vue'
 import StepProviderSelection from './step-provider-selection.vue'
 import StepWelcome from './step-welcome.vue'
 
+import { useAnalytics } from '../../../../composables/use-analytics'
 import { useConsciousnessStore } from '../../../../stores/modules/consciousness'
 import { useProvidersStore } from '../../../../stores/providers'
 
@@ -33,6 +35,7 @@ const emit = defineEmits<Emits>()
 const step = ref(0)
 const direction = ref<'next' | 'previous'>('next')
 const pendingProviderConfig = ref<ProviderConfigData | null>(null)
+const { trackOnboardingCompleted, trackOnboardingStarted, trackOnboardingStepCompleted } = useAnalytics()
 
 const providersStore = useProvidersStore()
 const { providers, allChatProvidersMetadata } = storeToRefs(providersStore)
@@ -43,7 +46,7 @@ const {
 
 // Popular providers for first-time setup
 const popularProviders = computed(() => {
-  const popular = ['openai', 'azure-openai', 'anthropic', 'google-generative-ai', 'groq', 'nvidia', 'openrouter-ai', 'ollama', 'deepseek', 'player2', 'openai-compatible']
+  const popular = ['openai', 'azure-openai', 'anthropic', 'amazon-bedrock', 'google-generative-ai', 'groq', 'nvidia', 'openrouter-ai', 'ollama', 'deepseek', 'player2', 'openai-compatible']
   return allChatProvidersMetadata.value
     .filter(provider => popular.includes(provider.id))
     .sort((a, b) => popular.indexOf(a.id) - popular.indexOf(b.id))
@@ -55,6 +58,12 @@ const selectedProviderId = ref('')
 // Computed selected provider
 const selectedProvider = computed(() => {
   return allChatProvidersMetadata.value.find(p => p.id === selectedProviderId.value) || null
+})
+
+const selectedProviderType = computed<ProviderMode>(() => {
+  if (!selectedProviderId.value)
+    return 'unknown'
+  return selectedProviderId.value.startsWith('official-provider') ? 'official' : 'custom'
 })
 
 // Reset validation state when provider changes
@@ -83,6 +92,12 @@ async function saveProviderConfiguration(data: ProviderConfigData) {
     config.baseUrl = data.baseUrl.trim()
   if (data.accountId)
     config.accountId = data.accountId.trim()
+  if (data.customFields) {
+    for (const [key, value] of Object.entries(data.customFields)) {
+      if (value)
+        config[key] = value.trim()
+    }
+  }
 
   providers.value[selectedProvider.value.id] = {
     ...providers.value[selectedProvider.value.id],
@@ -99,10 +114,6 @@ async function saveProviderConfiguration(data: ProviderConfigData) {
   catch (err) {
     console.error('[onboarding] Failed to load models for provider:', err)
   }
-}
-
-async function handleSave() {
-  emit('configured')
 }
 
 const allSteps = computed<OnboardingStep[]>(() => {
@@ -155,6 +166,16 @@ const currentStep = computed(() => allSteps.value[step.value] ?? null)
 const isLastStep = computed(() => step.value === allSteps.value.length - 1)
 const currentStepProps = computed(() => currentStep.value?.props?.() ?? {})
 
+async function handleSave() {
+  trackOnboardingStepCompleted(currentStep.value?.id ?? 'unknown')
+  trackOnboardingCompleted({
+    selected_provider_type: selectedProviderType.value,
+    selected_provider_id: selectedProviderId.value || undefined,
+    selected_use_case: 'unknown',
+  })
+  emit('configured')
+}
+
 async function canPassGuard(guard?: OnboardingStepGuard) {
   if (!guard)
     return true
@@ -174,6 +195,7 @@ async function navigateNext() {
     return
   }
 
+  trackOnboardingStepCompleted(currentStep.value.id)
   direction.value = 'next'
   step.value++
 }
@@ -188,6 +210,10 @@ async function navigatePrevious() {
   direction.value = 'previous'
   step.value--
 }
+
+onMounted(() => {
+  trackOnboardingStarted({ entry: 'app_start' })
+})
 </script>
 
 <template>

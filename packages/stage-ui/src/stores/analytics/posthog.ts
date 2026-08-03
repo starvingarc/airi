@@ -1,4 +1,5 @@
 import type { AboutBuildInfo } from '../../components/scenarios/about/types'
+import type { AnalyticsAdapter, AnalyticsAdapterOptions } from './client'
 
 import posthog from 'posthog-js'
 
@@ -6,70 +7,74 @@ import { isStageCapacitor, isStageTamagotchi } from '@proj-airi/stage-shared'
 
 import {
   DEFAULT_POSTHOG_CONFIG,
-  POSTHOG_ENABLED,
-  POSTHOG_PROJECT_KEY_DESKTOP,
-  POSTHOG_PROJECT_KEY_POCKET,
-  POSTHOG_PROJECT_KEY_WEB,
+  POSTHOG_PROJECT_KEY,
 } from '../../../../../posthog.config'
 
-let posthogInitialized = false
-
-function getPosthogProjectKey(): string {
+function currentSurface(): 'web' | 'mobile' | 'electron' {
   if (isStageTamagotchi())
-    return POSTHOG_PROJECT_KEY_DESKTOP
-
+    return 'electron'
   if (isStageCapacitor())
-    return POSTHOG_PROJECT_KEY_POCKET
-
-  return POSTHOG_PROJECT_KEY_WEB
+    return 'mobile'
+  return 'web'
 }
 
-export function isPosthogAvailableInBuild(): boolean {
-  return POSTHOG_ENABLED
-}
-
-export function ensurePosthogInitialized(enabled: boolean): boolean {
-  if (!POSTHOG_ENABLED)
-    return false
-
-  if (posthogInitialized)
-    return true
-
-  posthog.init(getPosthogProjectKey(), {
+/** Creates and initializes the default PostHog analytics adapter. */
+export function createPosthogAdapter(options: AnalyticsAdapterOptions): AnalyticsAdapter {
+  posthog.init(POSTHOG_PROJECT_KEY, {
     ...DEFAULT_POSTHOG_CONFIG,
-    opt_out_capturing_by_default: !enabled,
+    opt_out_capturing_by_default: !options.enabled,
   })
-  posthogInitialized = true
-  return true
-}
+  posthog.register({ app_surface: currentSurface() })
 
-export function syncPosthogCapture(enabled: boolean): boolean {
-  if (!POSTHOG_ENABLED)
-    return false
+  return {
+    capture(name, properties, captureOptions) {
+      if (posthog.has_opted_out_capturing())
+        return false
+      posthog.capture(
+        name,
+        { ...properties },
+        captureOptions?.beforeNavigation
+          ? { send_instantly: true, transport: 'sendBeacon' }
+          : undefined,
+      )
+      return true
+    },
+    getIdentitySnapshot() {
+      if (posthog.has_opted_out_capturing())
+        return null
 
-  if (enabled) {
-    ensurePosthogInitialized(true)
+      const distinctId = posthog.get_distinct_id()
+      if (!distinctId)
+        return null
 
-    if (posthog.has_opted_out_capturing())
-      posthog.opt_in_capturing()
+      const sessionId = posthog.get_session_id()
+      return { distinctId, ...(sessionId && { sessionId }) }
+    },
+    identify(userId) {
+      if (!posthog.has_opted_out_capturing())
+        posthog.identify(userId)
+    },
+    registerBuildInfo(buildInfo: AboutBuildInfo) {
+      posthog.register({
+        app_version: (buildInfo.version && buildInfo.version !== '0.0.0') ? buildInfo.version : 'dev',
+        app_commit: buildInfo.commit,
+        app_branch: buildInfo.branch,
+        app_build_time: buildInfo.builtOn,
+      })
+    },
+    resetIdentity() {
+      posthog.reset()
+    },
+    setCaptureEnabled(enabled) {
+      if (enabled) {
+        if (posthog.has_opted_out_capturing())
+          posthog.opt_in_capturing()
+        return true
+      }
 
-    return true
+      if (!posthog.has_opted_out_capturing())
+        posthog.opt_out_capturing()
+      return false
+    },
   }
-
-  if (posthogInitialized && !posthog.has_opted_out_capturing())
-    posthog.opt_out_capturing()
-
-  return false
-}
-
-export function registerPosthogBuildInfo(buildInfo: AboutBuildInfo): void {
-  if (!posthogInitialized)
-    return
-
-  posthog.register({
-    app_version: (buildInfo.version && buildInfo.version !== '0.0.0') ? buildInfo.version : 'dev',
-    app_commit: buildInfo.commit,
-    app_branch: buildInfo.branch,
-    app_build_time: buildInfo.builtOn,
-  })
 }

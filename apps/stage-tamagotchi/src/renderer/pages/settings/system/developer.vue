@@ -91,6 +91,12 @@ const menu = computed(() => [
     icon: 'i-solar:eye-closed-bold-duotone',
     to: '/devtools/vision',
   },
+  {
+    title: 'Global Shortcut',
+    description: 'Register/unregister global shortcuts and watch trigger events fire',
+    icon: 'i-solar:keyboard-bold-duotone',
+    to: '/devtools/global-shortcut',
+  },
 ])
 
 const openDevTools = useElectronEventaInvoke(electronOpenMainDevtools)
@@ -116,6 +122,15 @@ const openDevtoolsWindow = useElectronEventaInvoke(electronOpenDevtoolsWindow)
     @click="() => openDevtoolsWindow({ key: 'markdown-stress', route: '/devtools/markdown-stress' })"
   >
     {{ t('tamagotchi.settings.devtools.pages.markdown-stress.title') }}
+  </ButtonBar>
+  <ButtonBar
+    mb-2
+    icon="i-solar:chart-2-bold-duotone"
+    :text="t('tamagotchi.settings.devtools.pages.io-tracer.title')"
+    transition="all ease-in-out duration-250"
+    @click="() => openDevtoolsWindow({ key: 'io-tracer', route: '/devtools/io-tracer', width: 1600, height: 900 })"
+  >
+    {{ t('tamagotchi.settings.devtools.pages.io-tracer.title') }}
   </ButtonBar>
   <ButtonBar
     mb-2

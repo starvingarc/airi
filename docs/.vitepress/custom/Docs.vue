@@ -1,8 +1,14 @@
 <script setup lang="ts">
 import type { DefaultTheme } from 'vitepress/theme'
 
+import type { Author } from '../functions/authors.data'
+
+import { tryCatch } from '@moeru/std'
+import { intlFormat } from 'date-fns'
+import { AvatarFallback, AvatarImage, AvatarRoot } from 'reka-ui'
 import { Content, useData, useRoute } from 'vitepress'
 import { computed, toRefs } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 // import DocCarbonAds from '../components/DocCarbonAds.vue'
 import DocCommunity from '../components/DocCommunity.vue'
@@ -14,11 +20,39 @@ import DocTopbar from '../components/DocTopbar.vue'
 import { isBetweenHalloweenAndHalfOfNovember } from '../composables/date'
 import { flatten } from '../utils/flatten'
 
+import * as authorsData from '../functions/authors.data'
+
+const { t } = useI18n()
 const { theme, frontmatter } = useData()
 const { path } = toRefs(useRoute())
 
+/**
+ * Normalizes a document route or sidebar link before matching.
+ *
+ * Before:
+ * - "/zh-Hans/docs/manual/config/providers/consciousness/official.html"
+ * - "/zh-Hans/docs/manual/config/providers/consciousness/official/"
+ *
+ * After:
+ * - "/zh-Hans/docs/manual/config/providers/consciousness/official"
+ */
+function normalizeDocumentPath(value: string): string {
+  const withoutDocumentExtension = value.replace(/(?:\/index)?\.(?:html|md)$/, '')
+  const withoutTrailingSlash = withoutDocumentExtension.replace(/\/+$/, '')
+
+  return withoutTrailingSlash || '/'
+}
+
 const sidebar = computed(() => theme.value.sidebar as DefaultTheme.SidebarItem[])
-const activeSection = computed(() => sidebar.value.find(section => flatten(section.items ?? [], 'items')?.find(item => item.link === path.value.replace('.html', ''))))
+const activeSection = computed(() => {
+  const currentPath = normalizeDocumentPath(path.value)
+
+  return sidebar.value.find(section =>
+    flatten(section.items ?? [], 'items').some(item =>
+      item.link != null && normalizeDocumentPath(item.link) === currentPath,
+    ),
+  )
+})
 
 const isSidebarEnabled = computed(() => {
   if (frontmatter.value.sidebar === false) {
@@ -43,6 +77,36 @@ const isCommunityEnabled = computed(() => {
 })
 
 const isCharactersPage = computed(() => path.value.includes('characters'))
+
+const publishedAt = computed(() => {
+  if (frontmatter.value.publishedAtOverride) {
+    return frontmatter.value.publishedAtOverride
+  }
+
+  let date: string = ''
+  if (frontmatter.value.publishedAt) {
+    date = frontmatter.value.publishedAt
+  }
+  if (frontmatter.value.date) {
+    date = frontmatter.value.data
+  }
+  if (!date) {
+    return undefined
+  }
+
+  const { data, error } = tryCatch(() => intlFormat(new Date(frontmatter.value.publishedAt), { dateStyle: 'long' }))
+  if (error) {
+    console.error('Error formatting publishedAt date:', error)
+    return undefined
+  }
+
+  return data
+})
+
+const authors = computed(() => {
+  const data = (authorsData as unknown as { data: Array<{ url: string, authors: Author[] }> }).data
+  return data.find(item => item.url === path.value)?.authors || []
+})
 </script>
 
 <template>
@@ -88,6 +152,50 @@ const isCharactersPage = computed(() => path.value.includes('characters'))
           <h1>
             {{ frontmatter.title || '' }}
           </h1>
+
+          <div v-if="publishedAt || authors && authors.length" class="mb-10 mt-5 flex flex-col gap-3 sm:gap-5">
+            <div v-if="publishedAt" class="text-neutral-400 dark:text-neutral-500">
+              <span>
+                {{ t('docs.theme.doc.published-at', { date: publishedAt }) }}
+              </span>
+            </div>
+
+            <div class="flex flex-row gap-2 sm:gap-4">
+              <!-- Authors -->
+              <div v-for="(author, index) of authors" :key="index" class="flex flex-row items-center gap-2.5">
+                <AvatarRoot class="size-10 inline-flex select-none items-center justify-center overflow-hidden rounded-full bg-neutral-100 align-middle dark:bg-neutral-800">
+                  <AvatarImage
+                    class="h-full w-full rounded-[inherit] object-cover"
+                    :src="author.avatar || author.avatarFallback"
+                    :alt="`${author.displayName}'s avatar`"
+                  />
+                  <AvatarFallback
+                    class="h-full w-full flex items-center justify-center bg-white text-sm text-primary font-medium leading-1 dark:bg-neutral-800 dark:text-neutral-300"
+                    :delay-ms="600"
+                    as-child
+                  >
+                    {{
+                      [
+                        author.displayName.charAt(0).toUpperCase(),
+                        author.displayName.charAt(1).toUpperCase(),
+                      ].join('')
+                    }}
+                  </AvatarFallback>
+                </AvatarRoot>
+
+                <div class="flex flex-col">
+                  <div>
+                    <span>{{ author.displayName }}</span>
+                  </div>
+                  <div v-if="author.githubUsername">
+                    <a :href="`https://github.com/${author.githubUsername}`" target="_blank" rel="noopener noreferrer" class="text-sm text-primary hover:underline">
+                      <span>{{ author.githubUsername }}</span>
+                    </a>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
 
           <Content />
         </article>

@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import workletUrl from '@proj-airi/stage-ui/workers/vad/process.worklet?worker&url'
 
+import { errorMessageFromValue } from '@proj-airi/stage-shared'
 import { Alert, ErrorContainer, LevelMeter, RadioCardManySelect, RadioCardSimple, TestDummyMarker, ThresholdMeter, TimeSeriesChart } from '@proj-airi/stage-ui/components'
-import { useAnalytics, useAudioAnalyzer, useAudioRecorder } from '@proj-airi/stage-ui/composables'
+import { useAnalytics, useAudioAnalyzer, useAudioRecorder, useVoiceInputSession } from '@proj-airi/stage-ui/composables'
 import { useVAD } from '@proj-airi/stage-ui/stores/ai/models/vad'
 import { useAudioContext } from '@proj-airi/stage-ui/stores/audio'
 import { CONFIDENCE_THRESHOLD_DISABLED, useHearingSpeechInputPipeline, useHearingStore } from '@proj-airi/stage-ui/stores/modules/hearing'
@@ -77,10 +78,70 @@ const testStatusMessage = ref<string>('')
 const testStreamWasStarted = ref(false) // Track if we started the stream for testing
 
 const useVADThreshold = ref(0.6) // 0.1 - 0.9
+const useVADMinSilenceDurationMs = ref(800)
 const useVADModel = ref(true) // Toggle between VAD and volume-based detection
 const shouldUseStreamInput = computed(() => supportsStreamInput.value && !!stream.value)
+let sttTestStopTimer: ReturnType<typeof setTimeout> | undefined
+
+const sttTestVoiceInputSession = useVoiceInputSession(stream, {
+  shouldUseStreamInput,
+  // Manual Settings tests own their 3s recording window; automatic volume segmentation
+  // would race that timer and make provider diagnostics harder to interpret.
+  volumeFallback: {
+    enabled: false,
+  },
+  onSegmentStart: () => {
+    testStatusMessage.value = 'Recording audio for transcription... (3 seconds)'
+  },
+  onTranscriptionStart: () => {
+    testStatusMessage.value = 'Transcribing recording...'
+    isTranscribing.value = true
+  },
+  onTranscriptionResult: ({ text }) => {
+    testTranscriptionText.value = text
+    testStatusMessage.value = 'Transcription complete!'
+    isTranscribing.value = false
+    isTestingSTT.value = false
+    console.info('STT test transcription result:', text)
+  },
+  onTranscriptionEmpty: () => {
+    testTranscriptionError.value = transcriptionPipelineError.value || 'No transcription result returned from provider'
+    testStatusMessage.value = 'Transcription failed'
+    isTranscribing.value = false
+    isTestingSTT.value = false
+  },
+  onRecordingSkipped: ({ gate }) => {
+    testTranscriptionError.value = gate?.reason || transcriptionPipelineError.value || 'No recording captured from microphone'
+    testStatusMessage.value = 'Transcription failed'
+    isTranscribing.value = false
+    isTestingSTT.value = false
+  },
+  onTranscriptionError: ({ error }) => {
+    testTranscriptionError.value = errorMessageFromValue(error)
+    testStatusMessage.value = `Error: ${testTranscriptionError.value}`
+    isTranscribing.value = false
+    isTestingSTT.value = false
+    console.error('STT test transcription error:', error)
+  },
+})
+
+async function resetSttTestVoiceInputSession() {
+  if (sttTestStopTimer) {
+    clearTimeout(sttTestStopTimer)
+    sttTestStopTimer = undefined
+  }
+
+  await sttTestVoiceInputSession.stop({ flushActiveRecording: false })
+}
+
+function formatVADThreshold(value: number) {
+  return value.toFixed(2)
+}
 
 async function handleSpeechStart() {
+  if (isTestingSTT.value)
+    return
+
   if (shouldUseStreamInput.value && stream.value) {
     // Use both callbacks to support incremental updates and final transcript replacement.
     // ChatArea uses only onSentenceEnd to avoid re-adding deleted text.
@@ -99,6 +160,9 @@ async function handleSpeechStart() {
 }
 
 async function handleSpeechEnd() {
+  if (isTestingSTT.value)
+    return
+
   if (shouldUseStreamInput.value) {
     // For streaming providers, keep the session alive; idle timer will handle teardown.
     return
@@ -119,6 +183,7 @@ const {
   loading: loadingVAD,
 } = useVAD(workletUrl, {
   threshold: useVADThreshold,
+  minSilenceDurationMs: useVADMinSilenceDurationMs,
   onSpeechStart: () => {
     void handleSpeechStart()
   },
@@ -170,7 +235,7 @@ async function setupAudioMonitoring() {
   }
   catch (error) {
     console.error('Error setting up audio monitoring:', error)
-    vadModelError.value = error instanceof Error ? error.message : String(error)
+    vadModelError.value = errorMessageFromValue(error)
   }
 }
 
@@ -257,37 +322,11 @@ onStopRecord(async (recording) => {
   if (shouldUseStreamInput.value)
     return
 
+  if (isTestingSTT.value)
+    return
+
   if (!recording || recording.size === 0)
     return
-
-  // Handle STT test transcription directly here
-  if (isTestingSTT.value) {
-    testStatusMessage.value = 'Transcribing recording...'
-    isTranscribing.value = true
-
-    try {
-      const result = await transcribeForRecording(recording)
-      if (result) {
-        testTranscriptionText.value = result
-        testStatusMessage.value = 'Transcription complete!'
-        console.info('STT test transcription result:', result)
-      }
-      else {
-        testTranscriptionError.value = transcriptionPipelineError.value || 'No transcription result returned from provider'
-        testStatusMessage.value = 'Transcription failed'
-      }
-    }
-    catch (err) {
-      testTranscriptionError.value = err instanceof Error ? err.message : String(err)
-      testStatusMessage.value = `Error: ${testTranscriptionError.value}`
-      console.error('STT test transcription error:', err)
-    }
-    finally {
-      isTranscribing.value = false
-      isTestingSTT.value = false
-    }
-    return
-  }
 
   // Normal monitoring mode - add to audios and transcribe
   audios.value.push(recording)
@@ -386,17 +425,34 @@ async function startSTTTest() {
       testStatusMessage.value = 'Recording audio for transcription... (3 seconds)'
       console.info('Starting STT test with recording-based transcription for provider:', activeTranscriptionProvider.value)
 
-      startRecord()
+      const recordingStarted = await sttTestVoiceInputSession.startSegment('manual')
+      if (!recordingStarted) {
+        if (!testTranscriptionError.value)
+          testStatusMessage.value = 'Recording did not start'
+        isTranscribing.value = false
+        isTestingSTT.value = false
+        return
+      }
 
       // Wait a bit for recording to start, then stop it after a delay
-      setTimeout(async () => {
-        stopRecord()
+      sttTestStopTimer = setTimeout(async () => {
+        sttTestStopTimer = undefined
         testStatusMessage.value = 'Processing transcription...'
+        try {
+          await sttTestVoiceInputSession.stopSegment('manual')
+        }
+        catch (err) {
+          testTranscriptionError.value = errorMessageFromValue(err)
+          testStatusMessage.value = `Error: ${testTranscriptionError.value}`
+          isTranscribing.value = false
+          isTestingSTT.value = false
+          console.error('STT test stop timer error:', err)
+        }
       }, 3000) // Record for 3 seconds
     }
   }
   catch (err) {
-    testTranscriptionError.value = err instanceof Error ? err.message : String(err)
+    testTranscriptionError.value = errorMessageFromValue(err)
     testStatusMessage.value = `Error: ${testTranscriptionError.value}`
     isTranscribing.value = false
     isTestingSTT.value = false
@@ -415,7 +471,7 @@ async function stopSTTTest() {
       await stopStreamingTranscription(false, activeTranscriptionProvider.value)
     }
     else {
-      stopRecord()
+      await resetSttTestVoiceInputSession()
     }
   }
   catch (err) {
@@ -438,9 +494,6 @@ async function stopSTTTest() {
     }
   }
 }
-
-// Note: STT test transcription is now handled directly in onStopRecord handler above
-// This watch is kept for potential future use but is no longer needed for STT tests
 
 watch(selectedAudioInput, async () => isMonitoring.value && await setupAudioMonitoring())
 
@@ -528,8 +581,7 @@ onUnmounted(() => {
             <fieldset
               v-if="configuredTranscriptionProvidersMetadata.length > 0"
               flex="~ row gap-4"
-              :style="{ 'scrollbar-width': 'none' }"
-              min-w-0 of-x-scroll scroll-smooth
+              min-w-0 overflow-x-auto scroll-smooth
               role="radiogroup"
             >
               <RadioCardSimple
@@ -772,7 +824,17 @@ onUnmounted(() => {
                   :min="0.1"
                   :max="0.9"
                   :step="0.05"
-                  :format-value="value => `${(value * 100).toFixed(0)}%`"
+                  :format-value="formatVADThreshold"
+                />
+
+                <FieldRange
+                  v-model="useVADMinSilenceDurationMs"
+                  label="Pause Before Stop"
+                  description="How long silence must last before speech is considered finished"
+                  :min="200"
+                  :max="1500"
+                  :step="50"
+                  :format-value="value => `${value} ms`"
                 />
               </div>
 
@@ -846,6 +908,7 @@ onUnmounted(() => {
                 active-legend-label="Voice detected"
                 inactive-legend-label="Silence"
                 threshold-label="Speech threshold"
+                :format-threshold="formatVADThreshold"
               />
             </div>
           </div>

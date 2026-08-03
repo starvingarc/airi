@@ -1,10 +1,16 @@
-import { object, optional, picklist, string } from 'valibot'
+import { array, object, optional, picklist, string } from 'valibot'
 
 import { createConfig } from '../libs/electron/persistence'
 
+const shortcutAcceleratorSchema = object({
+  modifiers: array(picklist(['cmd-or-ctrl', 'cmd', 'ctrl', 'alt', 'shift', 'super'])),
+  key: string(),
+})
+
 export const globalAppConfigSchema = object({
-  language: optional(string(), 'en'),
-  updateChannel: optional(picklist(['stable', 'alpha', 'beta', 'nightly', 'canary'])),
+  language: optional(string()),
+  spotlightShortcutAccelerator: optional(shortcutAcceleratorSchema),
+  updateChannel: optional(picklist(['latest', 'stable', 'alpha', 'beta', 'nightly', 'canary'])),
 })
 
 export function createGlobalAppConfig() {

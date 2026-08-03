@@ -4,33 +4,43 @@ Own the Electron capture scenarios used to generate tamagotchi docs screenshots.
 
 ## Purpose
 
-This package owns product-specific Electron scenario definitions only. It depends on `@proj-airi/vishot-runner-electron` for:
+This package owns product-specific Electron scenario definitions and AIRI window/navigation helpers only. It depends on `@vishot/source-electron` for:
 
-- the `defineScenario()` helper
-- the capture context surface
-- Electron window and screenshot helpers exposed by the runner package
+- the generic `defineScenario()` helper
+- the generic Electron capture context surface
+- raw screenshot capture and scenario loading
 
 It does not launch Electron itself and it does not own browser-scene composition or shared screenshot staging.
 
 ## Workflow
 
-1. Build the Electron app.
-2. Run the Electron runner against a section-based scenario entrypoint under `src/scenarios/demo-controls-settings-chat-websocket/index.ts`.
-3. Write the scenario's raw working outputs into the scenario-local working directory.
-4. Publish the final docs screenshots directly into `docs/content/en/docs/manual/tamagotchi/setup-and-use/assets`.
-5. Skip any separate final staging directory for this docs workflow.
+This package is step 1 of the docs screenshot pipeline.
+
+1. Build `@proj-airi/stage-tamagotchi`.
+2. Run this scenario through `@vishot/cli`.
+3. Write raw outputs to `packages/scenarios-stage-tamagotchi-browser/artifacts/raw`.
+4. Then run the browser package capture (step 2, documented in that package README).
+
+## Agent Quickstart
+
+From repo root, run:
 
 ```bash
 pnpm -F @proj-airi/stage-tamagotchi build
-pnpm -F @proj-airi/vishot-runner-electron capture --format avif -- packages/scenarios-stage-tamagotchi-electron/src/scenarios/demo-controls-settings-chat-websocket/index.ts --output-dir /tmp/tamagotchi-docs-capture
+pnpm exec vishot capture --target electron ./packages/scenarios-stage-tamagotchi-electron/src/scenarios/demo-controls-settings-chat-websocket/index.ts --app-entrypoint ./apps/stage-tamagotchi/out/main/index.js --cwd . --output-dir ./packages/scenarios-stage-tamagotchi-browser/artifacts/raw --format avif
 ```
+
+Expected result:
+
+- `27` raw files in `packages/scenarios-stage-tamagotchi-browser/artifacts/raw`
+- names like `00-stage-tamagotchi.avif` ... `26-devtools-vision-capture.avif`
 
 ## Scenario Authoring
 
 ```ts
-import { defineScenario } from '@proj-airi/vishot-runner-electron'
+import { defineStageTamagotchiScenario } from '../context'
 
-export default defineScenario({
+export default defineStageTamagotchiScenario({
   id: 'settings-connection',
   async run({ capture, stageWindows, controlsIsland, settingsWindow }) {
     const mainWindow = await stageWindows.waitFor('main')
@@ -48,10 +58,32 @@ export default defineScenario({
 
 ## Scenario Layout
 
-The docs workflow is organized as one section-based scenario module under `src/scenarios/demo-controls-settings-chat-websocket/`. The top-level `index.ts` orchestrates section manifests and writes working outputs into the scenario-local raw directory, so the capture flow stays close to the scenario being authored.
+The docs workflow is organized as one section-based scenario module under `src/scenarios/demo-controls-settings-chat-websocket/`. The top-level `index.ts` orchestrates section manifests.
+
+Important:
+
+- `--output-dir` for `vishot capture` should point to `packages/scenarios-stage-tamagotchi-browser/artifacts/raw`.
+- This package does not publish docs assets directly; it only prepares raw assets for browser-scene composition.
 
 ## Notes
 
 - Raw scenario modules live under `src/scenarios`.
 - Scenario entrypoints should point at `index.ts` when the workflow is organized as a section folder.
 - Keep this package focused on Electron capture flows for docs screenshots.
+- Paths in these examples are resolved from the repository root.
+
+## Electron Profile Note (Plugin Discovery)
+
+When running scenarios through Vishot's generic Electron source capture, the built Electron app can use a different `userData` profile than `dev:tamagotchi`.
+
+- `dev:tamagotchi` plugin root commonly resolves to:
+  - `~/Library/Application Support/@proj-airi/stage-tamagotchi/plugins/v1`
+- Vishot/Electron capture runs can resolve plugin root to:
+  - `~/Library/Application Support/Electron/plugins/v1`
+
+If the chess plugin appears in dev but not in Vishot (`Discovered 0` or `Plugin manifest not found`), link the plugin `dist` directory into the Electron profile plugins root too:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/Electron/plugins/v1"
+ln -sfn "/absolute/path/to/airi-plugin-game-chess/dist" "$HOME/Library/Application Support/Electron/plugins/v1/airi-plugin-game-chess"
+```

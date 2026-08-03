@@ -10,6 +10,7 @@ import type {
 } from '@xsai-ext/providers/utils'
 import type { ProgressInfo } from '@xsai-transformers/shared/types'
 import type {
+  ListVoicesOptions,
   UnAlibabaCloudOptions,
   UnDeepgramOptions,
   UnElevenLabsOptions,
@@ -18,9 +19,12 @@ import type {
   VoiceProviderWithExtraOptions,
 } from 'unspeech'
 
+import type { ProviderSourceDeployment, ProviderSourcePricing } from '../libs/providers/source-metadata'
+import type { ProviderOnboardingField } from '../libs/providers/types'
 import type { AliyunRealtimeSpeechExtraOptions } from './providers/aliyun/stream-transcription'
 
-import { isStageTamagotchi, isUrl } from '@proj-airi/stage-shared'
+import { errorMessageFrom } from '@moeru/std'
+import { isCustomProvidersDisabled, isStageCapacitor, isStageTamagotchi, isUrl } from '@proj-airi/stage-shared'
 import { getCachedWebGPUCapabilities, isWebGPUSupported } from '@proj-airi/stage-shared/webgpu'
 import { computedAsync, useIntervalFn, useLocalStorage } from '@vueuse/core'
 import {
@@ -49,14 +53,18 @@ import { useI18n } from 'vue-i18n'
 
 import { getKokoroAdapter } from '../libs/inference/adapters/kokoro'
 import { getProviderValidationIntervalMs, listProviders as listDefinedProviders, ProviderValidationCheck } from '../libs/providers'
+import { resolveProviderSourceMetadata } from '../libs/providers/source-metadata'
 import { getDefaultKokoroModel, KOKORO_MODELS, kokoroModelsToModelInfo } from '../workers/kokoro/constants'
+import { captureAnalyticsEvent, ensureAnalyticsInitialized, isAnalyticsAvailableInBuild } from './analytics/client'
 import { useAuthStore } from './auth'
 import { createAliyunNLSProvider as createAliyunNlsStreamProvider } from './providers/aliyun/stream-transcription'
 import { convertProviderDefinitionsToMetadata } from './providers/converters'
 import { models as elevenLabsModels } from './providers/elevenlabs/list-models'
+import { buildGoogleGeminiSpeechProvider } from './providers/google-gemini-speech'
 import { buildOpenAICompatibleProvider } from './providers/openai-compatible-builder'
 import { buildOpenRouterAudioSpeechProvider } from './providers/openrouter/audio-speech'
 import { createWebSpeechAPIProvider } from './providers/web-speech-api'
+import { useSettingsAnalytics } from './settings/analytics'
 
 const ALIYUN_NLS_REGIONS = [
   'cn-shanghai',
@@ -69,10 +77,88 @@ const ALIYUN_NLS_REGIONS = [
 
 type AliyunNlsRegion = typeof ALIYUN_NLS_REGIONS[number]
 
+function toListVoicesOptions<T>(provider: VoiceProviderWithExtraOptions<T>, options?: T): ListVoicesOptions {
+  const { fetch: _fetch, ...voiceOptions } = provider.voice(options)
+  return voiceOptions
+}
+
+/**
+ * Classifies provider ids into bounded analytics buckets.
+ */
+function analyticsProviderMode(providerId: string): 'official' | 'custom' | 'unknown' {
+  if (!providerId)
+    return 'unknown'
+  return providerId.startsWith('official-provider') || providerId.startsWith('vision-official-provider') ? 'official' : 'custom'
+}
+
+/**
+ * Resolves the current app surface without importing the analytics store.
+ */
+function analyticsSurface(): 'web' | 'mobile' | 'electron' {
+  if (isStageTamagotchi())
+    return 'electron'
+
+  if (isStageCapacitor())
+    return 'mobile'
+
+  return 'web'
+}
+
+/**
+ * Checks analytics settings and initializes PostHog without loading build metadata.
+ */
+function canCaptureProviderAnalytics(): boolean {
+  if (!isAnalyticsAvailableInBuild())
+    return false
+
+  const settingsAnalytics = useSettingsAnalytics()
+  if (!settingsAnalytics.analyticsEnabled)
+    return false
+
+  return ensureAnalyticsInitialized(true)
+}
+
+/**
+ * Emits model-list analytics from the provider store without loading build metadata.
+ */
+function trackModelListLoaded(properties: {
+  provider_id: string
+  provider_mode: 'official' | 'custom' | 'unknown'
+  model_count: number
+  duration_ms: number
+}) {
+  if (!canCaptureProviderAnalytics())
+    return
+
+  captureAnalyticsEvent('model_list_loaded', {
+    ...properties,
+    app_surface: analyticsSurface(),
+  })
+}
+
+/**
+ * Emits model-list failure analytics from the provider store without loading build metadata.
+ */
+function trackModelListFailed(properties: {
+  provider_id: string
+  provider_mode: 'official' | 'custom' | 'unknown'
+  error_code: string
+  duration_ms: number
+}) {
+  if (!canCaptureProviderAnalytics())
+    return
+
+  captureAnalyticsEvent('model_list_failed', {
+    ...properties,
+    app_surface: analyticsSurface(),
+  })
+}
+
 export interface ProviderMetadata {
   id: string
+  to?: string
   order?: number
-  category: 'chat' | 'embed' | 'speech' | 'transcription'
+  category: 'chat' | 'embed' | 'speech' | 'transcription' | 'vision'
   tasks: string[]
   nameKey: string // i18n key for provider name
   name: string // Default name (fallback)
@@ -114,6 +200,7 @@ export interface ProviderMetadata {
    */
   iconImage?: string
   defaultOptions?: () => Record<string, unknown>
+  onboardingFields?: ProviderOnboardingField[]
   createProvider: (
     config: Record<string, unknown>,
   ) =>
@@ -135,7 +222,7 @@ export interface ProviderMetadata {
     | Promise<TranscriptionProviderWithExtraOptions>
   capabilities: {
     listModels?: (config: Record<string, unknown>) => Promise<ModelInfo[]>
-    listVoices?: (config: Record<string, unknown>) => Promise<VoiceInfo[]>
+    listVoices?: (config: Record<string, unknown>, model?: string) => Promise<VoiceInfo[]>
     loadModel?: (config: Record<string, unknown>, hooks?: { onProgress?: (progress: ProgressInfo) => Promise<void> | void }) => Promise<void>
   }
   validators: {
@@ -173,6 +260,9 @@ export interface ProviderMetadata {
     supportsStreamOutput: boolean
     supportsStreamInput: boolean
   }
+  pricing?: ProviderSourcePricing
+  deployment?: ProviderSourceDeployment
+  beginnerRecommended?: boolean
 }
 
 export interface ModelInfo {
@@ -269,6 +359,7 @@ export const useProvidersStore = defineStore('providers', () => {
       descriptionKey: 'settings.pages.providers.provider.speech-noop.description',
       description: 'No speech output.',
       icon: 'i-solar:volume-cross-bold-duotone',
+      requiresCredentials: false,
       defaultOptions: () => ({}),
       createProvider: async () => ({
         speech: () => ({
@@ -843,6 +934,7 @@ export const useProvidersStore = defineStore('providers', () => {
       descriptionKey: 'settings.pages.providers.provider.browser-web-speech-api.description',
       description: 'Browser-native speech recognition. No API keys.',
       icon: 'i-solar:microphone-bold-duotone',
+      requiresCredentials: false,
       defaultOptions: () => ({
         language: 'en-US',
         continuous: true,
@@ -944,9 +1036,7 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnElevenLabs((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnElevenLabsOptions>
 
-          const voices = await listVoices({
-            ...provider.voice(),
-          })
+          const voices = await listVoices(toListVoicesOptions(provider))
 
           if (!voices || !Array.isArray(voices)) {
             return []
@@ -1049,9 +1139,7 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnDeepgram((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnDeepgramOptions>
 
-          const voices = await listVoices({
-            ...provider.voice(),
-          })
+          const voices = await listVoices(toListVoicesOptions(provider))
 
           return voices.map((voice) => {
             return {
@@ -1115,9 +1203,7 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnMicrosoft((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnMicrosoftOptions>
 
-          const voices = await listVoices({
-            ...provider.voice({ region: config.region as string }),
-          })
+          const voices = await listVoices(toListVoicesOptions(provider, { region: config.region as string }))
 
           return voices.map((voice) => {
             return {
@@ -1261,9 +1347,7 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnAlibabaCloud((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnAlibabaCloudOptions>
 
-          const voices = await listVoices({
-            ...provider.voice(),
-          })
+          const voices = await listVoices(toListVoicesOptions(provider))
 
           return voices.map((voice) => {
             return {
@@ -1336,9 +1420,7 @@ export const useProvidersStore = defineStore('providers', () => {
         listVoices: async (config) => {
           const provider = createUnVolcengine((config.apiKey as string).trim(), (config.baseUrl as string).trim()) as VoiceProviderWithExtraOptions<UnVolcengineOptions>
 
-          const voices = await listVoices({
-            ...provider.voice(),
-          })
+          const voices = await listVoices(toListVoicesOptions(provider))
 
           return voices.map((voice) => {
             return {
@@ -1386,7 +1468,337 @@ export const useProvidersStore = defineStore('providers', () => {
         },
       },
     },
+    'minimax-speech': {
+      id: 'minimax-speech',
+      category: 'speech',
+      tasks: ['text-to-speech'],
+      nameKey: 'settings.pages.providers.provider.minimax-speech.title',
+      name: 'MiniMax Speech',
+      descriptionKey: 'settings.pages.providers.provider.minimax-speech.description',
+      description: 'minimax.io',
+      icon: 'i-lobe-icons:minimax',
+      iconColor: 'i-lobe-icons:minimax-color',
+      defaultOptions: () => ({
+        apiKey: '',
+        baseUrl: 'https://api.minimax.io',
+      }),
+      createProvider: async (config) => {
+        const apiKey = (config.apiKey as string).trim()
+        const baseUrl = ((config.baseUrl as string) || 'https://api.minimax.io').replace(/\/$/, '')
+
+        const provider: SpeechProvider = {
+          speech: () => ({
+            baseURL: `${baseUrl}/v1/`,
+            model: 'speech-2.8-hd',
+            fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+              if (!init?.body || typeof init.body !== 'string') {
+                throw new Error('Invalid request body')
+              }
+
+              const body = JSON.parse(init.body)
+              const text = body.input as string
+              const voiceId = (body.voice as string) || 'English_Graceful_Lady'
+              const model = (body.model as string) || 'speech-2.8-hd'
+
+              const response = await fetch(`${baseUrl}/v1/t2a_v2`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${apiKey}`,
+                },
+                body: JSON.stringify({
+                  model,
+                  text,
+                  stream: true,
+                  voice_setting: {
+                    voice_id: voiceId,
+                    speed: 1,
+                    vol: 1,
+                    pitch: 0,
+                  },
+                  audio_setting: {
+                    sample_rate: 32000,
+                    bitrate: 128000,
+                    format: 'mp3',
+                    channel: 1,
+                  },
+                }),
+              })
+
+              if (!response.ok || !response.body) {
+                throw new Error(`MiniMax TTS request failed: ${response.status} ${response.statusText}`)
+              }
+
+              // Parse SSE stream and collect hex-encoded audio chunks
+              const reader = response.body.getReader()
+              const decoder = new TextDecoder()
+              const audioChunks: Uint8Array[] = []
+              let buffer = ''
+
+              while (true) {
+                const { done, value } = await reader.read()
+                if (done)
+                  break
+                buffer += decoder.decode(value, { stream: true })
+                const lines = buffer.split('\n')
+                buffer = lines.pop() || ''
+                for (const line of lines) {
+                  if (!line.startsWith('data:'))
+                    continue
+                  const jsonStr = line.slice(5).trim()
+                  if (!jsonStr || jsonStr === '[DONE]')
+                    continue
+                  try {
+                    const eventData = JSON.parse(jsonStr)
+                    const audio = eventData?.data?.audio
+                    // status 2 is the final summary chunk; skip it to avoid duplication
+                    if (audio && eventData?.data?.status !== 2) {
+                      const hexStr = audio as string
+                      const bytes = new Uint8Array(hexStr.length / 2)
+                      for (let i = 0; i < hexStr.length; i += 2) {
+                        bytes[i / 2] = Number.parseInt(hexStr.slice(i, i + 2), 16)
+                      }
+                      audioChunks.push(bytes)
+                    }
+                  }
+                  catch {
+                    // ignore malformed SSE events
+                  }
+                }
+              }
+
+              const totalLength = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0)
+              const combined = new Uint8Array(totalLength)
+              let offset = 0
+              for (const chunk of audioChunks) {
+                combined.set(chunk, offset)
+                offset += chunk.length
+              }
+
+              return new Response(combined.buffer, {
+                status: 200,
+                headers: { 'Content-Type': 'audio/mpeg' },
+              })
+            },
+          }),
+        }
+        return provider
+      },
+      capabilities: {
+        listModels: async () => [
+          {
+            id: 'speech-2.8-hd',
+            name: 'Speech 2.8 HD',
+            provider: 'minimax-speech',
+            description: 'High-definition TTS model with natural prosody',
+            contextLength: 0,
+            deprecated: false,
+          },
+          {
+            id: 'speech-2.8-turbo',
+            name: 'Speech 2.8 Turbo',
+            provider: 'minimax-speech',
+            description: 'Fast TTS model for low-latency scenarios',
+            contextLength: 0,
+            deprecated: false,
+          },
+        ],
+        listVoices: async () => [
+          { id: 'English_Graceful_Lady', name: 'Graceful Lady', provider: 'minimax-speech', gender: 'female', languages: [{ code: 'en', title: 'English' }] },
+          { id: 'English_Insightful_Speaker', name: 'Insightful Speaker', provider: 'minimax-speech', gender: 'male', languages: [{ code: 'en', title: 'English' }] },
+          { id: 'English_radiant_girl', name: 'Radiant Girl', provider: 'minimax-speech', gender: 'female', languages: [{ code: 'en', title: 'English' }] },
+          { id: 'English_Persuasive_Man', name: 'Persuasive Man', provider: 'minimax-speech', gender: 'male', languages: [{ code: 'en', title: 'English' }] },
+          { id: 'English_Lucky_Robot', name: 'Lucky Robot', provider: 'minimax-speech', gender: 'neutral', languages: [{ code: 'en', title: 'English' }] },
+          { id: 'English_expressive_narrator', name: 'Expressive Narrator', provider: 'minimax-speech', gender: 'neutral', languages: [{ code: 'en', title: 'English' }] },
+          { id: 'Mandarin_Gentle_Woman', name: 'Gentle Woman', provider: 'minimax-speech', gender: 'female', languages: [{ code: 'zh', title: 'Chinese' }] },
+          { id: 'Mandarin_Steadfast_Man', name: 'Steadfast Man', provider: 'minimax-speech', gender: 'male', languages: [{ code: 'zh', title: 'Chinese' }] },
+          { id: 'Mandarin_Sweet_Girl', name: 'Sweet Girl', provider: 'minimax-speech', gender: 'female', languages: [{ code: 'zh', title: 'Chinese' }] },
+          { id: 'Mandarin_Magnetic_Gentleman', name: 'Magnetic Gentleman', provider: 'minimax-speech', gender: 'male', languages: [{ code: 'zh', title: 'Chinese' }] },
+        ],
+      },
+      validators: {
+        chatPingCheckAvailable: false,
+        validateProviderConfig: (config) => {
+          const errors = [
+            !config.apiKey && new Error('API key is required.'),
+          ].filter(Boolean)
+
+          return {
+            errors,
+            reason: errors.filter(e => e).map(e => String(e)).join(', ') || '',
+            valid: !!config.apiKey,
+          }
+        },
+      },
+    },
     'openrouter-audio-speech': buildOpenRouterAudioSpeechProvider(v => baseUrlValidator.value(v)),
+    'mimo-audio-speech': {
+      id: 'mimo-audio-speech',
+      category: 'speech',
+      tasks: ['text-to-speech'],
+      nameKey: 'settings.pages.providers.provider.mimo.title',
+      name: 'Xiaomi MiMo',
+      descriptionKey: 'settings.pages.providers.provider.mimo.description',
+      description: 'api.xiaomimimo.com',
+      icon: 'i-simple-icons:xiaomi',
+      defaultOptions: () => ({
+        baseUrl: 'https://api.xiaomimimo.com/v1/',
+        model: 'mimo-v2.5-tts',
+        voice: 'mimo_default',
+        format: 'wav',
+      }),
+      createProvider: async (config) => {
+        const apiKey = (config.apiKey as string)?.trim() ?? ''
+        const baseUrl = ((config.baseUrl as string) || 'https://api.xiaomimimo.com/v1/').replace(/\/+$/, '')
+        const defaultModel = (config.model as string) || 'mimo-v2.5-tts'
+        const defaultVoice = (config.voice as string) || 'mimo_default'
+        const defaultFormat = (config.format as string) || 'wav'
+
+        const provider: SpeechProvider = {
+          speech: () => ({
+            baseURL: `${baseUrl}/`,
+            model: defaultModel,
+            fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+              if (!init?.body || typeof init.body !== 'string') {
+                throw new Error('Invalid request body')
+              }
+
+              const body = JSON.parse(init.body)
+              const text = body.input as string
+              const modelId = (body.model as string) || defaultModel
+              const format = (body.response_format as string) || defaultFormat
+              const stylePrompt = typeof body.style_prompt === 'string'
+                ? body.style_prompt.trim()
+                : typeof config.stylePrompt === 'string'
+                  ? config.stylePrompt.trim()
+                  : ''
+              const voiceSample = typeof body.voice_sample === 'string'
+                ? body.voice_sample.trim()
+                : typeof config.voiceSample === 'string'
+                  ? config.voiceSample.trim()
+                  : ''
+
+              const userPrompt = modelId === 'mimo-v2.5-tts-voiceclone'
+                ? stylePrompt
+                : stylePrompt || 'Use a natural, clear speaking style.'
+
+              const audio: Record<string, string> = { format }
+              if (modelId === 'mimo-v2.5-tts-voiceclone') {
+                if (!voiceSample) {
+                  throw new Error('MiMo voice clone requires a base64 audio sample in data URI format.')
+                }
+                audio.voice = voiceSample
+              }
+              else if (modelId === 'mimo-v2.5-tts') {
+                audio.voice = (body.voice as string) || defaultVoice
+              }
+
+              if (modelId === 'mimo-v2.5-tts-voicedesign' && !stylePrompt) {
+                throw new Error('MiMo voice design requires a style prompt in the user message.')
+              }
+
+              const response = await fetch(`${baseUrl}/chat/completions`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'api-key': apiKey,
+                },
+                body: JSON.stringify({
+                  model: modelId,
+                  messages: [
+                    { role: 'user', content: userPrompt },
+                    { role: 'assistant', content: text },
+                  ],
+                  audio,
+                }),
+              })
+
+              if (!response.ok || !response.body) {
+                throw new Error(`MiMo TTS request failed: ${response.status} ${response.statusText}`)
+              }
+
+              const data = await response.json()
+              const audioBase64 = data?.choices?.[0]?.message?.audio?.data
+              if (!audioBase64) {
+                throw new Error('MiMo TTS response missing audio data')
+              }
+
+              const binaryString = atob(audioBase64)
+              const bytes = new Uint8Array(binaryString.length)
+              for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i)
+              }
+
+              const contentType = format === 'wav' ? 'audio/wav' : format === 'mp3' ? 'audio/mpeg' : `audio/${format}`
+              return new Response(bytes.buffer, {
+                status: 200,
+                headers: { 'Content-Type': contentType },
+              })
+            },
+          }),
+        }
+        return provider
+      },
+      capabilities: {
+        listModels: async () => [
+          {
+            id: 'mimo-v2.5-tts',
+            name: 'MiMo v2.5 TTS',
+            provider: 'mimo-audio-speech',
+            description: 'Preset voice synthesis with the built-in MiMo voice list',
+            contextLength: 0,
+            deprecated: false,
+          },
+          {
+            id: 'mimo-v2.5-tts-voicedesign',
+            name: 'MiMo v2.5 TTS Voice Design',
+            provider: 'mimo-audio-speech',
+            description: 'Design a new voice from a natural language description',
+            contextLength: 0,
+            deprecated: false,
+          },
+          {
+            id: 'mimo-v2.5-tts-voiceclone',
+            name: 'MiMo v2.5 TTS Voice Clone',
+            provider: 'mimo-audio-speech',
+            description: 'Clone a voice from a base64-encoded audio sample',
+            contextLength: 0,
+            deprecated: false,
+          },
+        ],
+        listVoices: async () => [
+          { id: 'mimo_default', name: 'MiMo-默认', provider: 'mimo-audio-speech', gender: 'female', languages: [{ code: 'en', title: 'English' }, { code: 'zh', title: 'Chinese' }] },
+          { id: '冰糖', name: '冰糖', provider: 'mimo-audio-speech', gender: 'female', languages: [{ code: 'zh', title: 'Chinese' }] },
+          { id: '茉莉', name: '茉莉', provider: 'mimo-audio-speech', gender: 'female', languages: [{ code: 'zh', title: 'Chinese' }] },
+          { id: '苏打', name: '苏打', provider: 'mimo-audio-speech', gender: 'male', languages: [{ code: 'zh', title: 'Chinese' }] },
+          { id: '白桦', name: '白桦', provider: 'mimo-audio-speech', gender: 'male', languages: [{ code: 'zh', title: 'Chinese' }] },
+          { id: 'Mia', name: 'Mia', provider: 'mimo-audio-speech', gender: 'female', languages: [{ code: 'en', title: 'English' }] },
+          { id: 'Chloe', name: 'Chloe', provider: 'mimo-audio-speech', gender: 'female', languages: [{ code: 'en', title: 'English' }] },
+          { id: 'Milo', name: 'Milo', provider: 'mimo-audio-speech', gender: 'male', languages: [{ code: 'en', title: 'English' }] },
+          { id: 'Dean', name: 'Dean', provider: 'mimo-audio-speech', gender: 'male', languages: [{ code: 'en', title: 'English' }] },
+        ],
+      },
+      validators: {
+        chatPingCheckAvailable: false,
+        validateProviderConfig: (config) => {
+          const errors = [
+            !config.apiKey && new Error('API key is required.'),
+            !config.baseUrl && new Error('Base URL is required.'),
+          ].filter(Boolean)
+
+          const res = baseUrlValidator.value(config.baseUrl)
+          if (res) {
+            return res
+          }
+
+          return {
+            errors,
+            reason: errors.map(e => (e as Error).message).join(', ') || '',
+            valid: !!config.apiKey && !!config.baseUrl,
+          }
+        },
+      },
+    },
     'comet-api-speech': buildOpenAICompatibleProvider({
       id: 'comet-api-speech',
       name: 'CometAPI Speech',
@@ -1419,6 +1831,156 @@ export const useProvidersStore = defineStore('providers', () => {
       ),
       validation: [ProviderValidationCheck.ModelList],
     }),
+    'mimo-audio-transcription': {
+      id: 'mimo-audio-transcription',
+      category: 'transcription',
+      tasks: ['speech-to-text', 'automatic-speech-recognition', 'asr', 'stt'],
+      nameKey: 'settings.pages.providers.provider.mimo.title',
+      name: 'Xiaomi MiMo',
+      descriptionKey: 'settings.pages.providers.provider.mimo.description',
+      description: 'api.xiaomimimo.com',
+      icon: 'i-simple-icons:xiaomi',
+      defaultOptions: () => ({
+        baseUrl: 'https://api.xiaomimimo.com/v1/',
+        model: 'mimo-v2-omni',
+      }),
+      createProvider: async (config) => {
+        const apiKey = (config.apiKey as string)?.trim() ?? ''
+        const rawBaseUrl = `${((config.baseUrl as string) || 'https://api.xiaomimimo.com/v1/').replace(/\/+$/, '')}/`
+        const defaultModel = (config.model as string) || 'mimo-v2-omni'
+
+        const provider: TranscriptionProvider = {
+          transcription: model => ({
+            baseURL: rawBaseUrl,
+            model: model || defaultModel,
+            headers: {},
+            fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+              const formData = init?.body as FormData
+              const file = formData?.get('file') as Blob | null
+              const modelName = (formData?.get('model') as string) || defaultModel
+
+              if (!file) {
+                throw new Error('No audio file provided for transcription.')
+              }
+
+              // Read the file as base64 data URI (works with both Blob and File)
+              const base64DataUri: string = await new Promise((resolve, reject) => {
+                const reader = new FileReader()
+                reader.onload = () => resolve(reader.result as string)
+                reader.onerror = () => reject(new Error('Failed to read audio file'))
+                reader.readAsDataURL(file)
+              })
+
+              // Extract format and base64 data from data URI
+              // data:audio/wav;base64,UklGR...
+              const mimeType = base64DataUri.split(';')[0]?.split(':')[1] || 'audio/wav'
+              const formatFromMime = mimeType.split('/')[1] || 'wav'
+              const base64Data = base64DataUri.split(',')[1]
+
+              // Map MIME sub-type to MiMo supported audio format
+              const audioFormat = formatFromMime === 'webm'
+                ? 'webm'
+                : formatFromMime === 'mp4'
+                  ? 'mp4'
+                  : formatFromMime === 'mpeg' || formatFromMime === 'mp3'
+                    ? 'mp3'
+                    : 'wav'
+
+              // MiMo audio understanding uses chat completions with input_audio,
+              // not a dedicated transcription endpoint
+              const response = await fetch(`${rawBaseUrl}chat/completions`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'api-key': apiKey,
+                },
+                body: JSON.stringify({
+                  model: modelName,
+                  messages: [
+                    {
+                      role: 'user',
+                      content: [
+                        { type: 'text', text: 'Transcribe the audio content.' },
+                        {
+                          type: 'input_audio',
+                          input_audio: {
+                            data: base64Data,
+                            format: audioFormat,
+                          },
+                        },
+                      ],
+                    },
+                  ],
+                }),
+              })
+
+              if (!response.ok) {
+                const errorBody = await response.text().catch(() => '')
+                throw new Error(
+                  `MiMo transcription failed: ${response.status} ${response.statusText}${errorBody ? ` — ${errorBody}` : ''}`,
+                )
+              }
+
+              const data = await response.json()
+              const text = data?.choices?.[0]?.message?.content || ''
+
+              // Return in OpenAI transcription response format { text: "..." }
+              return new Response(JSON.stringify({ text }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              })
+            },
+          }),
+        }
+
+        return provider
+      },
+      capabilities: {
+        listModels: async () => [
+          {
+            id: 'mimo-v2-omni',
+            name: 'MiMo V2 Omni',
+            provider: 'mimo-audio-transcription',
+            description: 'Omni-modal model with native audio understanding and speech-to-text',
+            contextLength: 256000,
+            deprecated: false,
+          },
+          {
+            id: 'mimo-v2.5',
+            name: 'MiMo V2.5',
+            provider: 'mimo-audio-transcription',
+            description: 'Latest omni-modal model with audio understanding, 1M context',
+            contextLength: 1_000_000,
+            deprecated: false,
+          },
+        ],
+      },
+      transcriptionFeatures: {
+        supportsGenerate: true,
+        supportsStreamOutput: false,
+        supportsStreamInput: false,
+      },
+      validators: {
+        chatPingCheckAvailable: false,
+        validateProviderConfig: (config) => {
+          const errors = [
+            !config.apiKey && new Error('API key is required.'),
+            !config.baseUrl && new Error('Base URL is required.'),
+          ].filter(Boolean)
+
+          const res = baseUrlValidator.value(config.baseUrl)
+          if (res) {
+            return res
+          }
+
+          return {
+            errors,
+            reason: errors.map(e => (e as Error).message).join(', ') || '',
+            valid: !!config.apiKey && !!config.baseUrl,
+          }
+        },
+      },
+    },
     'player2-speech': {
       id: 'player2-speech',
       category: 'speech',
@@ -1549,6 +2111,7 @@ export const useProvidersStore = defineStore('providers', () => {
       descriptionKey: 'settings.pages.providers.provider.kokoro-local.description',
       description: 'Local text-to-speech using Kokoro-82M.',
       icon: 'i-lobe-icons:speaker',
+      requiresCredentials: false,
 
       defaultOptions: () => {
         const capabilities = getCachedWebGPUCapabilities()
@@ -1751,12 +2314,26 @@ export const useProvidersStore = defineStore('providers', () => {
         },
       },
     },
+    'google-gemini-audio-speech': buildGoogleGeminiSpeechProvider(v => baseUrlValidator.value(v)),
+  }
+
+  const VISION_PROVIDER_ID_PREFIX = 'vision-'
+
+  function createVisionProviderMetadata(metadata: ProviderMetadata): ProviderMetadata {
+    return {
+      ...metadata,
+      id: `${VISION_PROVIDER_ID_PREFIX}${metadata.id}`,
+      to: `/settings/providers/vision/${metadata.id}`,
+      category: 'vision',
+      tasks: Array.from(new Set([...metadata.tasks, 'vision', 'image-understanding'])),
+    }
   }
 
   // Progressive migration bridge:
   // translate unified provider definitions from libs/providers to legacy store metadata.
   // Existing metadata remains as fallback for providers not yet migrated.
   const definedProviders = listDefinedProviders()
+  const definedProviderIds = new Set(definedProviders.map(d => d.id))
 
   const translatedProviderMetadata = convertProviderDefinitionsToMetadata(
     definedProviders,
@@ -1772,29 +2349,49 @@ export const useProvidersStore = defineStore('providers', () => {
     })
     if (intervalMs && intervalMs > 0) {
       providerValidationIntervalMsById.set(definition.id, intervalMs)
+      providerValidationIntervalMsById.set(`${VISION_PROVIDER_ID_PREFIX}${definition.id}`, intervalMs)
     }
   }
 
-  // Keep only legacy ASR/TTS providers and official providers as hand-written metadata.
-  // All other categories are sourced from unified definitions in libs/providers.
-  for (const [providerId, existing] of Object.entries(providerMetadata)) {
-    if (existing.category !== 'speech' && existing.category !== 'transcription') {
-      delete providerMetadata[providerId]
-    }
-  }
-
-  // Populate non-speech providers from unified registry translation.
+  // Merge unified registry definitions into providerMetadata.
+  // Unified defineProvider() entries always take precedence over legacy hand-written
+  // metadata. Legacy entries are kept only as fallback for providers not yet migrated
+  // to defineProvider().
+  // TODO: progressively migrate legacy speech/transcription providers to defineProvider()
+  // and remove the hand-written metadata above entirely.
   for (const [providerId, translated] of Object.entries(translatedProviderMetadata)) {
-    if (translated.category === 'speech' || translated.category === 'transcription') {
-      continue
-    }
     providerMetadata[providerId] = translated
+  }
+
+  for (const metadata of Object.values(providerMetadata)
+    .filter(metadata => metadata.category === 'chat')
+    .map(createVisionProviderMetadata)) {
+    providerMetadata[metadata.id] = metadata
+  }
+
+  for (const metadata of Object.values(providerMetadata)) {
+    if (definedProviderIds.has(metadata.id))
+      continue
+    Object.assign(metadata, resolveProviderSourceMetadata(metadata))
   }
 
   // const validatedCredentials = ref<Record<string, string>>({})
   const providerRuntimeState = ref<Record<string, ProviderRuntimeState>>({})
   const providerValidationInFlight = new Map<string, Promise<boolean>>()
-  const providerRevalidationLoops = new Map<string, { resume: () => void }>()
+  const providerRevalidationLoops = new Map<string, { pause: () => void, resume: () => void }>()
+
+  // Server-driven availability overrides for providers whose visibility can
+  // only be decided at runtime from the backend (e.g. the streaming TTS
+  // provider, which exists only when `UNSPEECH_UPSTREAM.streaming` is
+  // configured server-side). A `false` entry hides the provider from the
+  // available lists regardless of its static `isAvailableBy`; an absent entry
+  // means no override. Written by the auth-sync glue after it probes the
+  // server. Reactive so the available/configured provider lists re-derive.
+  const providerAvailabilityOverrides = ref<Record<string, boolean>>({})
+
+  function setProviderAvailabilityOverride(providerId: string, available: boolean) {
+    providerAvailabilityOverrides.value = { ...providerAvailabilityOverrides.value, [providerId]: available }
+  }
 
   const configuredProviders = computed(() => {
     const result: Record<string, boolean> = {}
@@ -1905,9 +2502,33 @@ export const useProvidersStore = defineStore('providers', () => {
   // Initialize all providers
   Object.keys(providerMetadata).forEach(initializeProvider)
 
+  function stopRevalidationLoop(providerId: string) {
+    const loop = providerRevalidationLoops.get(providerId)
+    if (!loop)
+      return
+    loop.pause()
+    providerRevalidationLoops.delete(providerId)
+  }
+
+  function reconcileUnlistedProviders() {
+    for (const providerId of Object.keys(providerMetadata)) {
+      if (shouldListProvider(providerId))
+        continue
+      stopRevalidationLoop(providerId)
+      const runtimeState = providerRuntimeState.value[providerId]
+      if (!runtimeState)
+        continue
+      runtimeState.isConfigured = false
+      runtimeState.validatedCredentialHash = undefined
+    }
+  }
+
   function startPeriodicRuntimeValidation() {
     for (const [providerId, intervalMs] of providerValidationIntervalMsById.entries()) {
       if (!providerMetadata[providerId] || intervalMs <= 0)
+        continue
+
+      if (!shouldListProvider(providerId))
         continue
 
       if (providerRevalidationLoops.has(providerId)) {
@@ -1922,11 +2543,10 @@ export const useProvidersStore = defineStore('providers', () => {
     }
   }
 
-  // Update configuration status for all configured providers
+  // Update configuration status for listed providers only.
   async function updateConfigurationStatus() {
     await Promise.all(Object.entries(providerMetadata)
-      // TODO: ignore un-configured provider
-      // .filter(([_, provider]) => provider.configured)
+      .filter(([providerId]) => shouldListProvider(providerId) || providerId === 'browser-web-speech-api')
       .map(async ([providerId]) => {
         try {
           if (providerRuntimeState.value[providerId]) {
@@ -1942,11 +2562,16 @@ export const useProvidersStore = defineStore('providers', () => {
       }))
   }
 
-  // Call initially and watch for changes
-  watch(providerCredentials, updateConfigurationStatus, { deep: true, immediate: true })
-  startPeriodicRuntimeValidation()
+  async function refreshListedProviderValidation() {
+    reconcileUnlistedProviders()
+    await updateConfigurationStatus()
+    startPeriodicRuntimeValidation()
+  }
 
-  watch(() => authState.isAuthenticated, updateConfigurationStatus)
+  // Call initially and watch for changes
+  watch(providerCredentials, refreshListedProviderValidation, { deep: true, immediate: true })
+  watch(addedProviders, refreshListedProviderValidation, { deep: true })
+  watch(() => authState.isAuthenticated, refreshListedProviderValidation)
 
   // Available providers (only those that are properly configured)
   const availableProviders = computed(() => Object.keys(providerMetadata).filter(providerId => providerRuntimeState.value[providerId]?.isConfigured))
@@ -2008,11 +2633,14 @@ export const useProvidersStore = defineStore('providers', () => {
     providerRuntimeState.value = {}
 
     Object.keys(providerMetadata).forEach(initializeProvider)
-    await updateConfigurationStatus()
+    providerRevalidationLoops.forEach(loop => loop.pause())
+    providerRevalidationLoops.clear()
+    await refreshListedProviderValidation()
   }
 
   // Function to fetch models for a specific provider
   async function fetchModelsForProvider(providerId: string) {
+    const startedAt = Date.now()
     const metadata = providerMetadata[providerId]
     if (!metadata)
       return []
@@ -2041,15 +2669,33 @@ export const useProvidersStore = defineStore('providers', () => {
             deprecated: model.deprecated,
             provider: providerId,
           }))
+        trackModelListLoaded({
+          provider_id: providerId,
+          provider_mode: analyticsProviderMode(providerId),
+          model_count: runtimeState.models.length,
+          duration_ms: Date.now() - startedAt,
+        })
         return runtimeState.models
       }
+      trackModelListLoaded({
+        provider_id: providerId,
+        provider_mode: analyticsProviderMode(providerId),
+        model_count: 0,
+        duration_ms: Date.now() - startedAt,
+      })
       return []
     }
     catch (error) {
       console.error(`Error fetching models for ${providerId}:`, error)
       if (runtimeState) {
-        runtimeState.modelLoadError = error instanceof Error ? error.message : 'Unknown error'
+        runtimeState.modelLoadError = errorMessageFrom(error) ?? 'Unknown error'
       }
+      trackModelListFailed({
+        provider_id: providerId,
+        provider_mode: analyticsProviderMode(providerId),
+        error_code: 'provider_error',
+        duration_ms: Date.now() - startedAt,
+      })
       return []
     }
     finally {
@@ -2123,14 +2769,40 @@ export const useProvidersStore = defineStore('providers', () => {
     }
   }
 
-  // Get all providers metadata (for settings page)
+  // Non-throwing variant of getProviderMetadata for capability checks against
+  // possibly-unset provider selections (fresh installs, reset state, deleted
+  // providers persist '' or stale ids in localStorage). Callers that require
+  // the provider to exist should keep using getProviderMetadata.
+  //
+  // Issue #1761: capability computeds used `getProviderMetadata(...)?.` as if
+  // it returned undefined, but it throws — surfacing raw "Provider metadata
+  // for  not found" errors whenever no provider was selected yet.
+  function findProviderMetadata(providerId: string) {
+    if (!providerId || !providerMetadata[providerId])
+      return undefined
+
+    return getProviderMetadata(providerId)
+  }
+
+  // Get all providers metadata (for settings page).
+  // Order: defined providers first (already sorted by order in registry), then legacy-only providers.
   const allProvidersMetadata = computed(() => {
-    return Object.values(providerMetadata).map(metadata => ({
+    const localize = (metadata: ProviderMetadata) => ({
       ...metadata,
       localizedName: t(metadata.nameKey, metadata.name),
       localizedDescription: t(metadata.descriptionKey, metadata.description),
       configured: providerRuntimeState.value[metadata.id]?.isConfigured || false,
-    }))
+    })
+
+    const ordered = definedProviders
+      .filter(d => providerMetadata[d.id])
+      .map(d => localize(providerMetadata[d.id]))
+
+    const legacy = Object.values(providerMetadata)
+      .filter(m => !definedProviderIds.has(m.id))
+      .map(localize)
+
+    return [...ordered, ...legacy]
   })
 
   function getTranscriptionFeatures(providerId: string) {
@@ -2194,11 +2866,22 @@ export const useProvidersStore = defineStore('providers', () => {
   }
 
   const availableProvidersMetadata = computedAsync<ProviderMetadata[]>(async () => {
+    // Spread-read the overrides synchronously so this re-runs when a
+    // server-driven availability flips: computedAsync uses watchEffect, which
+    // only tracks reactive reads before the first `await` — the per-provider
+    // `isAvailableBy()` below runs after one, so reads inside it aren't tracked.
+    const overrides = { ...providerAvailabilityOverrides.value }
     const providers: ProviderMetadata[] = []
 
     for (const provider of allProvidersMetadata.value) {
-      const p = getProviderMetadata(provider.id)
-      const isAvailableBy = p.isAvailableBy || (() => true)
+      if (overrides[provider.id] === false)
+        continue
+
+      const metadata = getProviderMetadata(provider.id)
+      if (isCustomProvidersDisabled() && metadata.requiresCredentials !== false)
+        continue
+
+      const isAvailableBy = metadata.isAvailableBy || (() => true)
 
       const isAvailable = await isAvailableBy()
       if (isAvailable) {
@@ -2221,6 +2904,10 @@ export const useProvidersStore = defineStore('providers', () => {
     return availableProvidersMetadata.value.filter(metadata => metadata.category === 'transcription')
   })
 
+  const allVisionProvidersMetadata = computed(() => {
+    return availableProvidersMetadata.value.filter(metadata => metadata.category === 'vision')
+  })
+
   const configuredChatProvidersMetadata = computed(() => {
     return allChatProvidersMetadata.value.filter(metadata => configuredProviders.value[metadata.id])
   })
@@ -2231,6 +2918,10 @@ export const useProvidersStore = defineStore('providers', () => {
 
   const configuredTranscriptionProvidersMetadata = computed(() => {
     return allAudioTranscriptionProvidersMetadata.value.filter(metadata => configuredProviders.value[metadata.id])
+  })
+
+  const configuredVisionProvidersMetadata = computed(() => {
+    return allVisionProvidersMetadata.value.filter(metadata => configuredProviders.value[metadata.id])
   })
 
   function isProviderConfigDirty(providerId: string) {
@@ -2262,6 +2953,10 @@ export const useProvidersStore = defineStore('providers', () => {
     return persistedProvidersMetadata.value.filter(metadata => metadata.category === 'transcription')
   })
 
+  const persistedVisionProvidersMetadata = computed(() => {
+    return persistedProvidersMetadata.value.filter(metadata => metadata.category === 'vision')
+  })
+
   function getProviderConfig(providerId: string) {
     return providerCredentials.value[providerId]
   }
@@ -2278,6 +2973,7 @@ export const useProvidersStore = defineStore('providers', () => {
     providerRuntimeState,
     providerMetadata,
     getProviderMetadata,
+    findProviderMetadata,
     getTranscriptionFeatures,
     allProvidersMetadata,
     initializeProvider,
@@ -2294,16 +2990,20 @@ export const useProvidersStore = defineStore('providers', () => {
     resetProviderSettings,
     forceProviderConfigured,
     setProviderUnconfigured,
+    setProviderAvailabilityOverride,
     availableProvidersMetadata,
     allChatProvidersMetadata,
     allAudioSpeechProvidersMetadata,
     allAudioTranscriptionProvidersMetadata,
+    allVisionProvidersMetadata,
     configuredChatProvidersMetadata,
     configuredSpeechProvidersMetadata,
     configuredTranscriptionProvidersMetadata,
+    configuredVisionProvidersMetadata,
     persistedProvidersMetadata,
     persistedChatProvidersMetadata,
     persistedSpeechProvidersMetadata,
     persistedTranscriptionProvidersMetadata,
+    persistedVisionProvidersMetadata,
   }
 })

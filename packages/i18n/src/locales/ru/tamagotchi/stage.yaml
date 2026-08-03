@@ -15,8 +15,11 @@ docs:
   'open-settings': Открыть настройки
   'open-chat': Открыть чат
   'refresh': Обновить результаты
+  'center-main-window': Переместить в центр экрана
   'open-hearing-controls': Управление слухом
   'drag-to-move-window': Перетащите окно
+  'stop-speaking': Остановить воспроизведение
+  'speaker-idle': Динамик
   'switch-to-light-mode': Переключить на светлую тему
   'switch-to-dark-mode': Переключить на темную тему
   'pin-on-top': Прикрепить на верх
@@ -29,6 +32,13 @@ docs:
   'logging-in': Выполняется вход...
   'account': Аккаунт
   'logout': Выйти
+widgets:
+  close: Закрыть виджет
+  empty:
+    title: Нет активных виджетов
+    description: Виджеты появятся здесь, когда появится инструмент или плагин.
+  loading: Загрузка виджета…
+  waiting: Ожидание данных виджета "{id}"…
 notice:
   'fade-on-hover':
     title: Исчезать при наведении

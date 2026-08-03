@@ -3,7 +3,8 @@ import type { ServerChannelQrPayload } from '@proj-airi/stage-shared/server-chan
 
 import { errorMessageFrom } from '@moeru/std'
 import { useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
-import { Button, Callout, Collapsible, useTheme } from '@proj-airi/ui'
+import { useAnalytics } from '@proj-airi/stage-ui/composables'
+import { Button, Callout, Collapsible } from '@proj-airi/ui'
 import { storeToRefs } from 'pinia'
 import { renderSVG } from 'uqr'
 import { computed, shallowRef, watch } from 'vue'
@@ -12,9 +13,15 @@ import { useI18n } from 'vue-i18n'
 import { electronGetServerChannelQrPayload } from '../../../../shared/eventa'
 import { useServerChannelSettingsStore } from '../../../stores/settings/server-channel'
 
-const { isDark } = useTheme()
 const { t } = useI18n()
+const { trackDevicePairingQrShown } = useAnalytics()
 const getServerChannelQrPayload = useElectronEventaInvoke(electronGetServerChannelQrPayload)
+
+function handleToggleExpanded(visible: boolean, setVisible: (value: boolean) => void) {
+  setVisible(visible)
+  if (visible)
+    trackDevicePairingQrShown()
+}
 const { authToken, hostname, tlsConfig } = storeToRefs(useServerChannelSettingsStore())
 
 const loading = shallowRef(false)
@@ -34,12 +41,22 @@ const qrCodeSource = computed(() => {
     return ''
   }
 
+  // NOTICE:
+  // Always render the QR as dark foreground on a white background, regardless of
+  // theme. Some mobile barcode scanners (including the underlying reader used by
+  // `@capacitor/barcode-scanner` on Android) fail to detect color-inverted QRs,
+  // which is what the previous theme-aware palette produced in dark mode.
+  // See https://github.com/moeru-ai/airi/issues/1606 and
+  // https://github.com/ionic-team/capacitor-barcode-scanner/issues/60 for context.
+  // Removal condition: once the Android scanner reliably recognizes light-on-dark QRs
+  // (e.g. after migrating to ML Kit with `TryInverted` enabled), this can revert to
+  // a theme-aware palette.
   const svg = renderSVG(payloadText.value, {
     border: 2,
     ecc: 'M',
     pixelSize: 8,
-    whiteColor: 'transparent',
-    blackColor: isDark.value ? '#D5D5D5' : '#121212',
+    whiteColor: '#FFFFFF',
+    blackColor: '#121212',
   })
 
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
@@ -73,7 +90,7 @@ watch([hostname, tlsConfig, authToken], () => {
         :class="[
           'w-full flex items-center justify-between gap-3 rounded-xl text-left outline-none transition-all duration-250 ease-in-out',
         ]"
-        @click="slotProps.setVisible(!slotProps.visible)"
+        @click="handleToggleExpanded(!slotProps.visible, slotProps.setVisible)"
       >
         <div :class="['min-w-0 flex flex-col gap-1']">
           <div :class="['text-sm font-medium text-neutral-900 dark:text-neutral-100']">

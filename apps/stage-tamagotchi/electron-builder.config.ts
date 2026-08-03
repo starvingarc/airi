@@ -97,6 +97,13 @@ export default {
   asarUnpack: [
     '**/*.node',
   ],
+  extraResources: [
+    {
+      from: '../../engines/stage-tamagotchi-godot/out/${os}',
+      to: 'godot-stage',
+      filter: ['**/*'],
+    },
+  ],
   extraMetadata: {
     name: 'ai.moeru.airi',
     main: 'out/main/index.js',
@@ -125,6 +132,7 @@ export default {
     deleteAppDataOnUninstall: true,
     oneClick: false,
     allowToChangeInstallationDirectory: true,
+    runAfterFinish: true,
   },
   mac: {
     entitlementsInherit: 'build/entitlements.mac.plist',

@@ -18,9 +18,10 @@ import type {
 } from '../../libs/inference/protocol'
 
 import { AutoModel, AutoProcessor, env, RawImage } from '@huggingface/transformers'
+import { errorMessageFromValue } from '@proj-airi/stage-shared'
 
 import { MODEL_IDS, MODEL_NAMES } from '../../libs/inference/constants'
-import { classifyError } from '../../libs/inference/protocol'
+import { classifyError, isRecoverable } from '../../libs/inference/protocol'
 
 // ---------------------------------------------------------------------------
 // Inference-specific input/output types
@@ -60,18 +61,44 @@ function sendProgress(requestId: string, percent: number, message?: string): voi
   globalThis.postMessage(msg)
 }
 
-function sendError(requestId: string, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error)
+function sendError(requestId: string, error: unknown, phase?: 'load' | 'inference'): void {
+  const message = errorMessageFromValue(error)
+  const code = classifyError(error, phase)
   const msg: ErrorResponse = {
     type: 'error',
     requestId,
     payload: {
-      code: classifyError(error),
+      code,
       message,
+      recoverable: isRecoverable(code),
+    },
+  }
+  globalThis.postMessage(msg)
+}
+
+// NOTICE: Cancellation tracking — see Whisper worker for rationale.
+const cancelledRequestIds = new Set<string>()
+
+function markCancelled(targetRequestId: string): void {
+  cancelledRequestIds.add(targetRequestId)
+  const msg: ErrorResponse = {
+    type: 'error',
+    requestId: targetRequestId,
+    payload: {
+      code: 'CANCELLED',
+      message: 'Operation cancelled by caller',
       recoverable: false,
     },
   }
   globalThis.postMessage(msg)
+}
+
+function isCancelled(requestId: string): boolean {
+  return cancelledRequestIds.has(requestId)
+}
+
+function clearCancelled(requestId: string): void {
+  cancelledRequestIds.delete(requestId)
 }
 
 /**
@@ -96,6 +123,10 @@ async function loadModel(request: LoadModelRequest): Promise<void> {
 
   try {
     if (model && processor) {
+      if (isCancelled(requestId)) {
+        clearCancelled(requestId)
+        return
+      }
       const ready: ModelReadyResponse = {
         type: 'model-ready',
         requestId,
@@ -128,6 +159,11 @@ async function loadModel(request: LoadModelRequest): Promise<void> {
 
     processor = await AutoProcessor.from_pretrained(MODEL_ID, {})
 
+    if (isCancelled(requestId)) {
+      clearCancelled(requestId)
+      return
+    }
+
     const ready: ModelReadyResponse = {
       type: 'model-ready',
       requestId,
@@ -137,7 +173,10 @@ async function loadModel(request: LoadModelRequest): Promise<void> {
     globalThis.postMessage(ready)
   }
   catch (error) {
-    sendError(requestId, error)
+    if (isCancelled(requestId))
+      clearCancelled(requestId)
+    else
+      sendError(requestId, error, 'load')
   }
 }
 
@@ -168,6 +207,11 @@ async function runInference(request: RunInferenceRequest<BackgroundRemovalInput>
       output[0].mul(255).to('uint8'),
     ).resize(width, height)
 
+    if (isCancelled(requestId)) {
+      clearCancelled(requestId)
+      return
+    }
+
     const maskData = new Uint8Array(mask.data.buffer)
 
     const result: InferenceResultResponse<BackgroundRemovalOutput> = {
@@ -179,7 +223,10 @@ async function runInference(request: RunInferenceRequest<BackgroundRemovalInput>
     ;(globalThis as any).postMessage(result, [maskData.buffer])
   }
   catch (error) {
-    sendError(requestId, error)
+    if (isCancelled(requestId))
+      clearCancelled(requestId)
+    else
+      sendError(requestId, error, 'inference')
   }
 }
 
@@ -201,6 +248,9 @@ globalThis.addEventListener('message', async (event: MessageEvent<WorkerInboundM
       model = null
       processor = null
       globalThis.postMessage({ type: 'model-unloaded', requestId: message.requestId })
+      break
+    case 'cancel':
+      markCancelled(message.targetRequestId)
       break
   }
 })

@@ -1,9 +1,8 @@
-import type { CaptureExecutionResult, ManualCaptureStep, ManualRuntime } from './types'
+import type { CaptureExecutionResult, ManualCaptureStep, ManualRuntime } from './types.ts'
 
 import { sleep } from '@moeru/std'
 
-import { publishArtifactsToDocs } from './output'
-import { ensureControlsIslandExpanded, getChatWindowSnapshot, getSettingsWindowSnapshot, waitForRouteReadiness } from './runtime'
+import { ensureControlsIslandExpanded, getChatWindowSnapshot, getSettingsWindowSnapshot, waitForRouteReadiness } from './runtime.ts'
 
 async function captureStepPage(step: ManualCaptureStep, runtime: ManualRuntime): Promise<CaptureExecutionResult> {
   let page
@@ -65,11 +64,9 @@ async function captureStepPage(step: ManualCaptureStep, runtime: ManualRuntime):
   }
 
   const artifacts = await runtime.context.capture(step.rawCaptureName, page)
-  const publishedArtifacts = await publishArtifactsToDocs(artifacts, step.docAssetFileName)
 
   return {
     artifacts,
-    publishedArtifacts,
   }
 }
 

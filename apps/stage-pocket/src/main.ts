@@ -6,6 +6,8 @@ import NProgress from 'nprogress'
 
 import { autoAnimatePlugin } from '@formkit/auto-animate/vue'
 import { isEnvTruthy } from '@proj-airi/stage-shared'
+import { trackButtonPlugin } from '@proj-airi/stage-ui/directives/track-button'
+import { configureAnalyticsAdapter } from '@proj-airi/stage-ui/stores/analytics/client'
 import { MotionPlugin } from '@vueuse/motion'
 import { createPinia } from 'pinia'
 import { setupLayouts } from 'virtual:generated-layouts'
@@ -15,6 +17,7 @@ import { routes } from 'vue-router/auto-routes'
 
 import App from './App.vue'
 
+import { installDeepLinks } from './modules/deep-links'
 import { i18n } from './modules/i18n'
 
 import '@proj-airi/font-cjkfonts-allseto/index.css'
@@ -24,6 +27,11 @@ import 'splitpanes/dist/splitpanes.css'
 import 'vue-sonner/style.css'
 import './styles/main.css'
 import 'uno.css'
+
+configureAnalyticsAdapter(async (options) => {
+  const { createPosthogAdapter } = await import('@proj-airi/stage-ui/stores/analytics/posthog')
+  return createPosthogAdapter(options)
+})
 
 const pinia = createPinia()
 
@@ -49,6 +57,8 @@ window.addEventListener('unhandledrejection', (event) => {
   console.warn('Unhandled rejection:', event.reason)
 })
 
+installDeepLinks(router)
+
 createApp(App)
   .use(MotionPlugin)
   // TODO: Fix autoAnimatePlugin type error
@@ -57,6 +67,7 @@ createApp(App)
   .use(pinia)
   .use(i18n)
   .use(Tres)
+  .use(trackButtonPlugin)
   .mount('#app')
 
 if (import.meta.env.DEV && !import.meta.env.SSR) {

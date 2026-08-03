@@ -4,6 +4,7 @@ import type { InferOutput } from 'valibot'
 import type { I18n } from '../../libs/i18n'
 import type { WindowAuthManager } from '../../services/airi/auth'
 import type { ServerChannel } from '../../services/airi/channel-server'
+import type { GodotStageManager } from '../../services/airi/godot-stage'
 import type { McpStdioManager } from '../../services/airi/mcp-servers'
 import type { AutoUpdater } from '../../services/electron/auto-updater'
 import type { NoticeWindowManager } from '../notice'
@@ -22,7 +23,7 @@ import { defineInvokeHandler } from '@moeru/eventa'
 import { createContext } from '@moeru/eventa/adapters/electron/main'
 import { initScreenCaptureForWindow } from '@proj-airi/electron-screen-capture/main'
 import { defu } from 'defu'
-import { BrowserWindow, ipcMain, shell } from 'electron'
+import { BrowserWindow, ipcMain } from 'electron'
 import { isLinux, isMacOS } from 'std-env'
 import { array, number, object, optional, string } from 'valibot'
 
@@ -32,7 +33,7 @@ import { electronStartDraggingWindow } from '../../../shared/eventa'
 import { onAppBeforeQuit } from '../../libs/bootkit/lifecycle'
 import { baseUrl, getElectronMainDirname, load } from '../../libs/electron/location'
 import { createConfig } from '../../libs/electron/persistence'
-import { transparentWindowConfig } from '../shared'
+import { protectPrivilegedWindowNavigation, transparentWindowConfig } from '../shared'
 import { setupMainWindowElectronInvokes } from './rpc/index.electron'
 
 const appConfigSchema = object({
@@ -56,6 +57,7 @@ export async function setupMainWindow(params: {
   autoUpdater: AutoUpdater
   onWindowCreated?: (window: BrowserWindow) => void
   serverChannel: ServerChannel
+  godotStageManager: GodotStageManager
   mcpStdioManager: McpStdioManager
   i18n: I18n
   onboardingWindowManager: OnboardingWindowManager
@@ -169,12 +171,7 @@ export async function setupMainWindow(params: {
   }
 
   window.on('ready-to-show', () => window!.show())
-  window.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
-    return { action: 'deny' }
-  })
-
-  await load(window, baseUrl(resolve(getElectronMainDirname(), '..', 'renderer')))
+  protectPrivilegedWindowNavigation(window)
 
   await setupMainWindowElectronInvokes({
     window,
@@ -184,11 +181,14 @@ export async function setupMainWindow(params: {
     noticeWindow: params.noticeWindow,
     autoUpdater: params.autoUpdater,
     serverChannel: params.serverChannel,
+    godotStageManager: params.godotStageManager,
     mcpStdioManager: params.mcpStdioManager,
     i18n: params.i18n,
     onboardingWindowManager: params.onboardingWindowManager,
     windowAuthManager: params.windowAuthManager,
   })
+
+  await load(window, baseUrl(resolve(getElectronMainDirname(), '..', 'renderer')))
 
   /**
    * This is a know issue (or expected behavior maybe) to Electron.

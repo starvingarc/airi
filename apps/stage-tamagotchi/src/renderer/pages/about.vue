@@ -3,16 +3,18 @@ import type { BugReportDialogSubmitPayload } from '@proj-airi/stage-ui/component
 
 import type { ElectronUpdaterChannel } from '../../shared/eventa'
 
+import semver from 'semver'
+
 import { useElectronAutoUpdater, useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
 import { AboutContent, BugReportDialog, createBugReportPageContext, MarkdownRenderer } from '@proj-airi/stage-ui/components'
-import { useBreakpoints } from '@proj-airi/stage-ui/composables'
+import { useAnalytics, useBreakpoints } from '@proj-airi/stage-ui/composables'
 import { useSharedAnalyticsStore } from '@proj-airi/stage-ui/stores/analytics'
 import { Button, ContainerError, DoubleCheckButton, FieldSelect, Progress } from '@proj-airi/ui'
 import { useClipboard } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
 import { DialogContent, DialogDescription, DialogOverlay, DialogPortal, DialogRoot, DialogTitle } from 'reka-ui'
 import { DrawerContent, DrawerDescription, DrawerHandle, DrawerOverlay, DrawerPortal, DrawerRoot, DrawerTitle } from 'vaul-vue'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { electronGetUpdaterPreferences, electronSetUpdaterPreferences } from '../../shared/eventa'
@@ -29,6 +31,12 @@ const {
   downloadUpdate,
   quitAndInstall,
 } = useElectronAutoUpdater()
+
+const {
+  trackUpdateDownloaded,
+  trackUpdateInstallClicked,
+  trackSettingsChanged,
+} = useAnalytics()
 
 const isDisabled = computed(() => updateState.value.status === 'disabled')
 const isLatestVersion = computed(() => {
@@ -54,12 +62,14 @@ const updaterErrorMessage = computed(() => {
 const showChangelog = ref(false)
 const showBugReportDialog = ref(false)
 const { isDesktop } = useBreakpoints()
-const updateChannelOptions = ['auto', 'stable', 'alpha', 'beta', 'nightly', 'canary'] as const
+const updateChannelOptions = ['auto', 'latest', 'stable', 'alpha', 'beta', 'nightly', 'canary'] as const
+type UpdateChannelOption = typeof updateChannelOptions[number]
 const updateChannelSelectOptions = computed(() => updateChannelOptions.map(channel => ({
-  label: t(`tamagotchi.stage.about.update.channels.${channel}`),
+  label: channel === 'latest'
+    ? 'Latest (any release)'
+    : t(`tamagotchi.stage.about.update.channels.${channel}`),
   value: channel,
 })))
-type UpdateChannelOption = typeof updateChannelOptions[number]
 const selectedUpdateChannel = ref<UpdateChannelOption>('auto')
 const isUpdateChannelUpdating = ref(false)
 const bugReportDescription = ref('')
@@ -88,8 +98,44 @@ const restartButtonLabel = computed(() => {
     : t('tamagotchi.stage.about.update.actions.restart-install')
 })
 
+const requiresWindowsAdminUpdatePrompt = computed(() => {
+  return isWindowsUpdater.value && updateState.value.diagnostics?.requiresAdminForInstallPath === true
+})
+
+const updateInstallDirectory = computed(() => {
+  return updateState.value.diagnostics?.installDirectory ?? updateState.value.diagnostics?.executablePath ?? ''
+})
+
+function normalizeSemver(version: string | undefined) {
+  if (!version)
+    return undefined
+
+  return semver.valid(version) ?? semver.valid(version.startsWith('v') ? version.slice(1) : version)
+}
+
+const isDowngradeUpdate = computed(() => {
+  const currentVersion = normalizeSemver(buildInfo.value.version)
+  const targetVersion = normalizeSemver(updateState.value.info?.version)
+  if (!currentVersion || !targetVersion)
+    return false
+
+  return semver.lt(targetVersion, currentVersion)
+})
+
 const getUpdaterPreferences = useElectronEventaInvoke(electronGetUpdaterPreferences)
 const setUpdaterPreferences = useElectronEventaInvoke(electronSetUpdaterPreferences)
+
+function handleQuitAndInstall() {
+  trackUpdateInstallClicked({ channel: selectedUpdateChannel.value, version: updateState.value.info?.version })
+  quitAndInstall()
+}
+
+// Fires on the state transition (not the download click) so the event means
+// "an update binary actually landed on this machine".
+watch(() => updateState.value.status, (status) => {
+  if (status === 'downloaded')
+    trackUpdateDownloaded({ channel: selectedUpdateChannel.value, version: updateState.value.info?.version })
+})
 
 function handleDownloadClick() {
   if (updateState.value.info?.releaseNotes)
@@ -153,9 +199,16 @@ async function setUpdateChannelPreference(channel: UpdateChannelOption) {
 
   isUpdateChannelUpdating.value = true
   try {
+    const previousChannel = selectedUpdateChannel.value
     const nextChannel = channel === 'auto' ? undefined : channel as ElectronUpdaterChannel
     const preferences = await setUpdaterPreferences({ channel: nextChannel })
     selectedUpdateChannel.value = preferences?.channel ?? 'auto'
+    trackSettingsChanged({
+      setting_name: 'update_channel',
+      previous_value: previousChannel,
+      new_value: selectedUpdateChannel.value,
+      source: 'settings',
+    })
     await checkForUpdates()
   }
   finally {
@@ -237,12 +290,28 @@ onMounted(() => {
 
             <!-- Update Logic -->
             <div :class="['flex flex-col gap-4']">
+              <div
+                v-if="requiresWindowsAdminUpdatePrompt"
+                :class="['text-sm rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-amber-700 dark:text-amber-200']"
+              >
+                AIRI is installed in a protected Windows folder. Update install may require a UAC admin prompt.
+                <div :class="['mt-1 text-xs break-all text-amber-700/80 dark:text-amber-100/80']">
+                  Path: {{ updateInstallDirectory }}
+                </div>
+              </div>
+
               <!-- State: Available -->
               <div v-if="updateState.status === 'available'" :class="['flex flex-col gap-4']">
                 <div :class="['text-sm flex flex-wrap items-center gap-2']">
                   <span :class="['font-mono text-neutral-600 dark:text-neutral-300']">v{{ buildInfo.version }}</span>
                   <div :class="['i-solar:arrow-right-line-duotone text-lg text-neutral-400']" />
                   <span :class="['font-mono text-pink-500 dark:text-pink-400 font-bold']">v{{ updateState.info?.version }}</span>
+                </div>
+                <div
+                  v-if="isDowngradeUpdate"
+                  :class="['text-sm rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-amber-700 dark:text-amber-200']"
+                >
+                  Selected channel offers an older build than your current version. Installing this update will downgrade AIRI.
                 </div>
                 <div>
                   <Button
@@ -272,10 +341,16 @@ onMounted(() => {
                 <div :class="['text-sm text-emerald-600 dark:text-emerald-400']">
                   {{ downloadedStatusText }}
                 </div>
+                <div
+                  v-if="isDowngradeUpdate"
+                  :class="['text-sm rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-amber-700 dark:text-amber-200']"
+                >
+                  Downgrade package downloaded from selected channel. Restart will install an older version.
+                </div>
                 <div>
                   <DoubleCheckButton
                     variant="primary"
-                    @confirm="quitAndInstall()"
+                    @confirm="handleQuitAndInstall()"
                   >
                     {{ restartButtonLabel }}
                     <template #confirm>
@@ -303,6 +378,7 @@ onMounted(() => {
 
                 <div :class="['flex flex-wrap gap-2']">
                   <Button
+                    v-track-button="{ name: 'update_check_clicked', channel: selectedUpdateChannel }"
                     :variant="isError ? 'caution' : 'secondary'"
                     :loading="isBusy"
                     :disabled="isDisabled"

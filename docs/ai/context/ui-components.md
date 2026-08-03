@@ -74,9 +74,33 @@ Loading placeholder with animation.
 
 **Slots**: `default`
 
+### Truncatable
+
+Line-clamped content container that expands and collapses when the overflowing content area is clicked.
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `lineClamp` | `number?` | `3` | Maximum visible lines while collapsed |
+
+**Slots**: `default`
+
 ---
 
 ## Misc
+
+### Avatar
+
+Shared user-avatar primitive built on Reka UI. It retries when `src` changes and
+renders the fallback when the URL is missing, loading, or fails.
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `src` | `string \| null \| undefined` | `null` | Avatar image URL |
+| `alt` | `string \| null \| undefined` | `null` | Accessible image/fallback description; omit for decorative avatars |
+| `referrerPolicy` | `ImgHTMLAttributes['referrerpolicy']?` | — | Image referrer policy |
+| `crossOrigin` | `ImgHTMLAttributes['crossorigin']?` | — | Image cross-origin mode |
+
+**Slots**: `fallback` (optional override for the built-in user icon)
 
 ### Button
 
@@ -125,6 +149,20 @@ Error display with copy/feedback buttons and scrollable stack trace.
 | `heightPreset` | `'sm' \| 'md' \| 'lg' \| 'xl' \| 'auto'` | `'md'` | Container height |
 
 **Emits**: `copy(content: string)`, `feedback()`
+
+### ErrorBoundary
+
+Catches synchronous render/setup errors in descendants via `onErrorCaptured` and renders a fallback (built-in `ContainerError` + retry button) instead of letting the error propagate. Use to wrap `<RouterView>` or any subtree where partial failure should not blank the host layout. Async/unhandled rejections are NOT captured — use `app.config.errorHandler` for those.
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `title` | `string?` | — | Optional title shown above error details |
+| `retryable` | `boolean?` | `true` | Show built-in retry button |
+| `retryLabel` | `string?` | `'Try again'` | Retry button label |
+
+**Slots**: `default`, `fallback({ error, info, retry })`
+**Emits**: `error(err, instance, info)`, `retry()`
+**Exposed**: `retry()`, `hasError()`
 
 ### DoubleCheckButton
 
@@ -355,6 +393,7 @@ Searchable dropdown/autocomplete using reka-ui with grouping.
 | `options` | `ComboboxOptionItem<T>[] \| ComboboxOptionGroupItem<T>[]` | *(required)* | Options |
 | `placeholder` | `string?` | — | Placeholder |
 | `disabled` | `boolean?` | `false` | Disabled |
+| `openOnClick` | `boolean?` | `true` | Auto-open dropdown on click |
 | `contentMinWidth` | `string \| number?` | — | Dropdown min width |
 | `contentWidth` | `string \| number?` | — | Dropdown width |
 
@@ -370,6 +409,7 @@ Simplified Combobox wrapper for string/number options.
 | `options` | `{ label, value, description?, disabled?, icon? }[]?` | — | Options |
 | `placeholder` | `string?` | — | Placeholder |
 | `disabled` | `boolean?` | `false` | Disabled |
+| `openOnClick` | `boolean?` | `true` | Auto-open dropdown on click |
 | `title` | `string?` | — | Title |
 | `layout` | `'horizontal' \| 'vertical'?` | — | Layout direction |
 | `contentMinWidth` | `string \| number?` | — | Dropdown min width |
@@ -422,6 +462,7 @@ All Field components wrap a base input with `label`, `description`, and consiste
 | `placeholder` | `string?` | — | Placeholder |
 | `required` | `boolean?` | — | Required indicator |
 | `type` | `InputType?` | — | Input type |
+| `autocomplete` | `string?` | — | Native autocomplete hint |
 | `inputClass` | `string?` | — | Custom input class |
 | `singleLine` | `boolean?` | `true` | `true` = input, `false` = textarea |
 
@@ -462,6 +503,7 @@ All Field components wrap a base input with `label`, `description`, and consiste
 | `description` | `string?` | — | Helper text |
 | `formatValue` | `(value: number) => string?` | — | Value formatter |
 | `as` | `'label' \| 'div'` | `'label'` | Wrapper element |
+| `defaultValue` | `number?` | — | When set, shows a reset button next to the label that restores this value. Use with `as="div"`. |
 
 **v-model**: `modelValue: number`
 
@@ -503,6 +545,7 @@ All Field components wrap a base input with `label`, `description`, and consiste
 | `options` | `{ label, value, description?, disabled?, icon? }[]?` | — | Options |
 | `placeholder` | `string?` | — | Placeholder |
 | `disabled` | `boolean?` | `false` | Disabled |
+| `openOnClick` | `boolean?` | `true` | Auto-open dropdown on click |
 | `layout` | `'horizontal' \| 'vertical'` | `'horizontal'` | Layout |
 
 **v-model**: `modelValue: string`
