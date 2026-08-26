@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import type { ProviderMetadata } from '../../../../stores/providers'
+import type { ProviderMetadata } from '../../../../libs/providers/metadata'
 import type { OnboardingStepNextHandler, OnboardingStepPrevHandler } from './types'
 
 import { errorMessageFrom } from '@moeru/std'
 import { Button, Callout, FieldCheckbox, FieldInput } from '@proj-airi/ui'
+import { computedAsync } from '@vueuse/core'
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
-import { useProvidersStore } from '../../../../stores/providers'
+import { useProviderStore } from '../../../../stores/providers/provider'
 import { Alert } from '../../../misc'
 import { ProviderAccountIdInput } from '../../../scenarios/providers'
 
@@ -20,7 +21,7 @@ interface Props {
 
 const props = defineProps<Props>()
 const { t } = useI18n()
-const providersStore = useProvidersStore()
+const providersStore = useProviderStore()
 
 const apiKey = ref('')
 const baseUrl = ref('')
@@ -39,7 +40,7 @@ function initializeForm() {
   if (!provider)
     return
 
-  const defaultOptions = provider.defaultOptions?.() ?? {}
+  const defaultOptions = provider.defaultConfig
   baseUrl.value = ('baseUrl' in defaultOptions ? String(defaultOptions.baseUrl) : '') || ''
   apiKey.value = ''
   accountId.value = ''
@@ -86,9 +87,12 @@ const needsBaseUrl = computed(() => {
   return props.selectedProvider.id !== 'cloudflare-workers-ai'
 })
 
-const showChatCheckOption = computed(() => {
-  return props.selectedProvider?.validators.chatPingCheckAvailable
-})
+const showChatCheckOption = computedAsync(
+  async () => props.selectedProvider
+    ? await providersStore.hasManualProviderValidators(props.selectedProvider.id)
+    : false,
+  false,
+)
 
 const canProceed = computed(() => {
   if (!props.selectedProviderId)
@@ -141,8 +145,7 @@ async function validateConfiguration() {
     }
 
     // Validate using provider's validator
-    const metadata = providersStore.getProviderMetadata(props.selectedProvider.id)
-    const validationResult = await metadata.validators.validateProviderConfig(config, {
+    const validationResult = await providersStore.validateProviderConfig(props.selectedProvider.id, config, {
       skipChatPingCheck: !enableChatCheck.value,
     })
     validation.value = validationResult.valid ? 'succeed' : 'failed'
@@ -206,8 +209,10 @@ function getApiKeyPlaceholder(providerId: string): string {
 }
 
 function getBaseUrlPlaceholder(_providerId: string): string {
-  const defaultOptions = props.selectedProvider?.defaultOptions?.() || {}
-  return (defaultOptions as any)?.baseUrl || 'https://api.example.com/v1/'
+  const defaultOptions = props.selectedProvider?.defaultConfig ?? {}
+  return typeof defaultOptions.baseUrl === 'string' && defaultOptions.baseUrl
+    ? defaultOptions.baseUrl
+    : 'https://api.example.com/v1/'
 }
 
 // Initialize on mount
