@@ -14,7 +14,6 @@ import './theme-vitepress.css'
 import './theme-markdown.css'
 import './theme-media.css'
 import './theme-kbd.css'
-import './theme-animations.css'
 import './custom-nixie.css'
 import '@fontsource-variable/quicksand/index.css'
 import '@fontsource-variable/dm-sans/index.css'
@@ -26,7 +25,7 @@ export default {
   Layout,
   enhanceApp({ app, siteData }) {
     if (!import.meta.env.SSR && import.meta.env.PROD) {
-      import('../modules/posthog')
+      import('../modules/openpanel')
     }
 
     const i18n = createI18n({

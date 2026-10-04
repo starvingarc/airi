@@ -69,6 +69,89 @@ export function centerWindowOnDisplay(window: Pick<BrowserWindow, 'getBounds' | 
   return centeredBounds
 }
 
+/**
+ * Returns whether two rectangles share a positive-area intersection.
+ */
+export function rectanglesOverlap(first: Rectangle, second: Rectangle): boolean {
+  return first.x < second.x + second.width
+    && first.x + first.width > second.x
+    && first.y < second.y + second.height
+    && first.y + first.height > second.y
+}
+
+/**
+ * Restores a saved window position inside a currently available display work area.
+ *
+ * Use when:
+ * - A saved window position may refer to a display that is no longer connected
+ * - A window was moved partly or completely outside the visible desktop
+ *
+ * Expects:
+ * - `matchingWorkArea` is the work area selected for the saved bounds when available
+ * - `fallbackWorkArea` is a currently visible work area, usually the primary display
+ *
+ * Returns:
+ * - Bounds that preserve the saved size when possible and keep the window reachable
+ *
+ * @example
+ * restoreWindowBounds({
+ *   savedBounds: { x: -200, y: 700, width: 450, height: 600 },
+ *   matchingWorkArea: { x: 0, y: 25, width: 1440, height: 875 },
+ *   fallbackWorkArea: { x: 0, y: 25, width: 1440, height: 875 },
+ * })
+ * // => { x: 0, y: 300, width: 450, height: 600 }
+ */
+export function restoreWindowBounds(options: {
+  savedBounds: Rectangle
+  matchingWorkArea?: Rectangle
+  fallbackWorkArea: Rectangle
+  /** Connected work areas whose union can contain the saved window. */
+  workAreas?: readonly Rectangle[]
+}): Rectangle {
+  if (options.workAreas && isCoveredByWorkAreas(options.savedBounds, options.workAreas))
+    return { ...options.savedBounds }
+
+  const workArea = options.matchingWorkArea ?? options.fallbackWorkArea
+  const width = Math.min(Math.max(1, options.savedBounds.width), workArea.width)
+  const height = Math.min(Math.max(1, options.savedBounds.height), workArea.height)
+
+  return {
+    x: clamp(options.savedBounds.x, workArea.x, workArea.x + workArea.width - width),
+    y: clamp(options.savedBounds.y, workArea.y, workArea.y + workArea.height - height),
+    width,
+    height,
+  }
+}
+
+function isCoveredByWorkAreas(bounds: Rectangle, workAreas: readonly Rectangle[]): boolean {
+  let uncovered = [bounds]
+  // Subtract each work area so gaps and overlapping displays do not count as visible space twice.
+  for (const area of workAreas) {
+    uncovered = uncovered.flatMap((part) => {
+      if (!rectanglesOverlap(part, area))
+        return [part]
+
+      const left = Math.max(part.x, area.x)
+      const top = Math.max(part.y, area.y)
+      const right = Math.min(part.x + part.width, area.x + area.width)
+      const bottom = Math.min(part.y + part.height, area.y + area.height)
+      const remainder: Rectangle[] = []
+      if (part.y < top)
+        remainder.push({ x: part.x, y: part.y, width: part.width, height: top - part.y })
+      if (bottom < part.y + part.height)
+        remainder.push({ x: part.x, y: bottom, width: part.width, height: part.y + part.height - bottom })
+      if (part.x < left)
+        remainder.push({ x: part.x, y: top, width: left - part.x, height: bottom - top })
+      if (right < part.x + part.width)
+        remainder.push({ x: right, y: top, width: part.x + part.width - right, height: bottom - top })
+      return remainder
+    })
+    if (uncovered.length === 0)
+      return true
+  }
+  return false
+}
+
 export interface DominantDisplayResizeOptions {
   /** Current window bounds in Electron display coordinates. */
   currentBounds: Rectangle
@@ -220,7 +303,7 @@ export function mapForBreakpoints<
   basedOn: number,
   sizes: { [key in keyof B]?: number } | number,
   options?: { breakpoints: B },
-) {
+): number {
   if (typeof sizes === 'number') {
     return sizes
   }
@@ -244,8 +327,16 @@ export function mapForBreakpoints<
     .sort((a, b) => b.min - a.min) // Sort descending by min width
 
   const fallback = sortedSizes.find(s => s.min <= basedOn)
+  if (fallback?.value != null) {
+    return fallback.value
+  }
 
-  return fallback?.value ?? Object.values(sizes)?.[0] ?? 0
+  // `basedOn` is below every supplied breakpoint (e.g. height < 640 with sm/md/lg
+  // sizes): use the breakpoint with the smallest minimum width. Selecting by min
+  // instead of `Object.values(sizes)[0]` keeps the result stable when the sizes
+  // object keys are reordered (e.g. by lint sorting rules).
+  const smallest = sortedSizes[sortedSizes.length - 1]
+  return smallest?.value ?? 0
 }
 
 /**
